@@ -69,9 +69,9 @@ async def read_anomaly_event(
 async def ingest_anomaly_event(
     payload: AnomalyEventCreate,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ) -> AnomalyEventRead:
-    event = await create_anomaly_event(db, payload)
+    event = await create_anomaly_event(db, payload, audit_actor=current_user.email)
     return AnomalyEventRead.model_validate(event)
 
 
@@ -79,9 +79,11 @@ async def ingest_anomaly_event(
 async def acknowledge_anomaly_event(
     event_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ) -> AnomalyEventRead:
-    event = await update_anomaly_status(db, event_id, AnomalyStatus.INVESTIGATING)
+    event = await update_anomaly_status(
+        db, event_id, AnomalyStatus.INVESTIGATING, audit_actor=current_user.email
+    )
     if event is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Anomaly not found")
     return AnomalyEventRead.model_validate(event)
@@ -91,9 +93,11 @@ async def acknowledge_anomaly_event(
 async def resolve_anomaly_event(
     event_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ) -> AnomalyEventRead:
-    event = await update_anomaly_status(db, event_id, AnomalyStatus.RESOLVED)
+    event = await update_anomaly_status(
+        db, event_id, AnomalyStatus.RESOLVED, audit_actor=current_user.email
+    )
     if event is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Anomaly not found")
     return AnomalyEventRead.model_validate(event)
@@ -103,9 +107,11 @@ async def resolve_anomaly_event(
 async def dismiss_anomaly_event(
     event_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ) -> AnomalyEventRead:
-    event = await update_anomaly_status(db, event_id, AnomalyStatus.DISMISSED)
+    event = await update_anomaly_status(
+        db, event_id, AnomalyStatus.DISMISSED, audit_actor=current_user.email
+    )
     if event is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Anomaly not found")
     return AnomalyEventRead.model_validate(event)
@@ -115,9 +121,11 @@ async def dismiss_anomaly_event(
 async def reopen_anomaly_event(
     event_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(get_current_user),
+    current_user: User = Depends(get_current_user),
 ) -> AnomalyEventRead:
-    event = await update_anomaly_status(db, event_id, AnomalyStatus.OPEN)
+    event = await update_anomaly_status(
+        db, event_id, AnomalyStatus.OPEN, audit_actor=current_user.email
+    )
     if event is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Anomaly not found")
     return AnomalyEventRead.model_validate(event)

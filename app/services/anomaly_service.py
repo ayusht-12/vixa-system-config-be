@@ -23,32 +23,90 @@ from app.schemas.anomaly import (
     SeveritySummaryBucket,
     ThreatCategoryStat,
 )
+from app.schemas.audit import AuditLogEntryCreate
+from app.services.audit_service import append_entry_in_transaction
 
 _HEATMAP_WINDOW_HOURS = 24
 _ML_MODEL_NAME = "IsolationForest v3.2"
 
 
-async def create_anomaly_event(db: AsyncSession, payload: AnomalyEventCreate) -> AnomalyEvent:
+def _audit_actor(primary: str | None, fallback: str | None = None) -> str:
+    return primary or fallback or "system"
+
+
+def _audit_metadata(event: AnomalyEvent, *, previous_status: AnomalyStatus | None = None) -> dict:
+    metadata = {
+        "anomaly_id": str(event.id),
+        "category": event.category,
+        "severity": event.severity.value,
+        "status": event.status.value,
+        "score": event.score,
+        "metadata_json": event.metadata_json,
+    }
+    if previous_status is not None:
+        metadata["previous_status"] = previous_status.value
+    return metadata
+
+
+async def _append_anomaly_audit(
+    db: AsyncSession,
+    event: AnomalyEvent,
+    *,
+    actor: str,
+    subtype: str,
+    description: str,
+    previous_status: AnomalyStatus | None = None,
+) -> None:
+    await append_entry_in_transaction(
+        db,
+        AuditLogEntryCreate(
+            severity="info",
+            event_type="anomaly_detected",
+            event_subtype=subtype,
+            actor=actor,
+            description=description,
+            tenant_id=event.tenant_id,
+            source_ip=event.source_ip,
+            metadata_json=_audit_metadata(event, previous_status=previous_status),
+        ),
+    )
+
+
+async def create_anomaly_event(
+    db: AsyncSession, payload: AnomalyEventCreate, *, audit_actor: str | None = None
+) -> AnomalyEvent:
     """Ingest a new anomaly. Severity is derived from the ML score server-side —
     clients report a confidence score, never a severity label directly, so the
     classification boundary lives in one place (`AnomalySeverity.from_score`).
     """
-    event = AnomalyEvent(
-        tenant_id=payload.tenant_id,
-        category=payload.category,
-        score=payload.score,
-        severity=AnomalySeverity.from_score(payload.score),
-        status=AnomalyStatus.OPEN,
-        title=payload.title,
-        description=payload.description,
-        actor=payload.actor,
-        source_ip=payload.source_ip,
-        baseline_sigma=payload.baseline_sigma,
-        metadata_json=payload.metadata_json,
-        occurred_at=datetime.now(timezone.utc),
-    )
-    db.add(event)
-    await db.commit()
+    try:
+        event = AnomalyEvent(
+            tenant_id=payload.tenant_id,
+            category=payload.category,
+            score=payload.score,
+            severity=AnomalySeverity.from_score(payload.score),
+            status=AnomalyStatus.OPEN,
+            title=payload.title,
+            description=payload.description,
+            actor=payload.actor,
+            source_ip=payload.source_ip,
+            baseline_sigma=payload.baseline_sigma,
+            metadata_json=payload.metadata_json,
+            occurred_at=datetime.now(timezone.utc),
+        )
+        db.add(event)
+        await db.flush()
+        await _append_anomaly_audit(
+            db,
+            event,
+            actor=_audit_actor(audit_actor, payload.actor),
+            subtype="ANOMALY_CREATED",
+            description=f"Anomaly created: {event.title}",
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     await db.refresh(event)
     return event
 
@@ -221,17 +279,40 @@ async def get_anomaly_detection_overview(db: AsyncSession) -> AnomalyDetectionOv
 
 
 async def update_anomaly_status(
-    db: AsyncSession, event_id: uuid.UUID, status_value: AnomalyStatus
+    db: AsyncSession,
+    event_id: uuid.UUID,
+    status_value: AnomalyStatus,
+    *,
+    audit_actor: str | None = None,
 ) -> AnomalyEvent | None:
-    event = await db.get(AnomalyEvent, event_id)
-    if event is None:
-        return None
-    event.status = status_value
-    if status_value == AnomalyStatus.RESOLVED:
-        event.resolved_at = datetime.now(timezone.utc)
-    elif status_value == AnomalyStatus.OPEN:
-        event.resolved_at = None
-    await db.commit()
+    try:
+        event = await db.get(AnomalyEvent, event_id)
+        if event is None:
+            await db.rollback()
+            return None
+
+        previous_status = event.status
+        event.status = status_value
+        if status_value == AnomalyStatus.RESOLVED:
+            event.resolved_at = datetime.now(timezone.utc)
+        elif status_value == AnomalyStatus.OPEN:
+            event.resolved_at = None
+
+        await db.flush()
+        await _append_anomaly_audit(
+            db,
+            event,
+            actor=_audit_actor(audit_actor, event.actor),
+            subtype="ANOMALY_STATUS_UPDATED",
+            description=(
+                f"Anomaly status updated: {previous_status.value} -> {event.status.value}"
+            ),
+            previous_status=previous_status,
+        )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     await db.refresh(event)
     return event
 
