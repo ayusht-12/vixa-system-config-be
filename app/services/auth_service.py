@@ -9,6 +9,12 @@ from app.core.security import generate_refresh_token, hash_refresh_token, verify
 from app.models.user import RefreshToken, User
 
 
+def _as_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
 async def authenticate_user(db: AsyncSession, email: str, password: str) -> User | None:
     result = await db.execute(select(User).where(User.email == email.lower()))
     user = result.scalar_one_or_none()
@@ -46,7 +52,7 @@ async def redeem_refresh_token(db: AsyncSession, raw_token: str) -> User | None:
     token = result.scalar_one_or_none()
     if token is None or token.revoked_at is not None:
         return None
-    if token.expires_at < datetime.now(timezone.utc):
+    if _as_aware_utc(token.expires_at) < datetime.now(timezone.utc):
         return None
 
     token.revoked_at = datetime.now(timezone.utc)
