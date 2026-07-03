@@ -237,6 +237,7 @@ async def list_entries(
             prev_hash=e.prev_hash,
             entry_hash=e.entry_hash,
             signing_key_id=e.signing_key_id,
+            signature=e.signature,
             integrity="valid",
         )
         for e in entries

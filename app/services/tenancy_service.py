@@ -2,18 +2,21 @@ import uuid
 from datetime import datetime, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.models.tenancy import (
     PROVISIONING_STEPS,
     BreachAlert,
+    ProvisioningJobStatus,
     SnapshotStatus,
     Tenant,
     TenantBackupSnapshot,
     TenantProvisioningJob,
     TenantSchemaValidation,
+    TenantStatus,
 )
 from app.schemas.tenancy import (
     BackupSnapshotRead,
@@ -22,8 +25,10 @@ from app.schemas.tenancy import (
     ProvisioningJobRead,
     ProvisioningStepRead,
     TenancyOverview,
+    TenantCreate,
     TenantRead,
     TenantSchemaValidationRead,
+    TenantUpdate,
 )
 
 _STEP_LABELS = {
@@ -38,7 +43,7 @@ _STEP_LABELS = {
 _STALE_SNAPSHOT_AFTER_HOURS = 24
 
 
-def _tenant_to_read(tenant: Tenant) -> TenantRead:
+def tenant_to_read(tenant: Tenant) -> TenantRead:
     return TenantRead(
         id=tenant.id,
         slug=tenant.slug,
@@ -145,7 +150,7 @@ async def get_tenancy_overview(db: AsyncSession) -> TenancyOverview:
     snapshots = snapshots_result.scalars().all()
 
     return TenancyOverview(
-        tenants=[_tenant_to_read(t) for t in tenants],
+        tenants=[tenant_to_read(t) for t in tenants],
         isolation_summary=_isolation_summary(tenants),
         breach_alerts=[
             BreachAlertRead(
@@ -245,3 +250,108 @@ async def advance_provisioning_job(db: AsyncSession, job_id: uuid.UUID) -> Tenan
     await db.commit()
     await db.refresh(job, attribute_names=["tenant"])
     return job
+
+
+async def list_tenants(
+    db: AsyncSession,
+    *,
+    page: int,
+    page_size: int,
+    status_filter: TenantStatus | None = None,
+    search: str | None = None,
+) -> tuple[list[TenantRead], int]:
+    query = select(Tenant)
+    count_query = select(func.count()).select_from(Tenant)
+
+    if status_filter is not None:
+        query = query.where(Tenant.status == status_filter)
+        count_query = count_query.where(Tenant.status == status_filter)
+    if search:
+        pattern = f"%{search}%"
+        condition = Tenant.display_name.ilike(pattern) | Tenant.slug.ilike(pattern)
+        query = query.where(condition)
+        count_query = count_query.where(condition)
+
+    total = (await db.execute(count_query)).scalar_one()
+
+    query = (
+        query.order_by(Tenant.display_name).offset((page - 1) * page_size).limit(page_size)
+    )
+    tenants = (await db.execute(query)).scalars().all()
+    return [tenant_to_read(t) for t in tenants], total
+
+
+async def get_tenant(db: AsyncSession, tenant_id: uuid.UUID) -> Tenant:
+    tenant = await db.get(Tenant, tenant_id)
+    if tenant is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Tenant not found")
+    return tenant
+
+
+async def create_tenant(db: AsyncSession, payload: TenantCreate) -> Tenant:
+    tenant = Tenant(
+        id=uuid.uuid4(),
+        slug=payload.slug,
+        org_id=payload.org_id,
+        display_name=payload.display_name,
+        tier=payload.tier,
+        isolation_mode=payload.isolation_mode,
+        status=TenantStatus.PROVISIONING,
+        region=payload.region,
+        db_schema_name=payload.db_schema_name,
+        db_schema_valid=False,
+        network_cidr=payload.network_cidr,
+        network_vpc=payload.network_vpc,
+        network_shared=payload.network_shared,
+        dek_label=payload.dek_label,
+        encryption_valid=False,
+        events_per_second=0.0,
+    )
+    db.add(tenant)
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A tenant with this slug or org_id already exists",
+        ) from exc
+
+    db.add(
+        TenantProvisioningJob(
+            id=uuid.uuid4(),
+            tenant_id=tenant.id,
+            status=ProvisioningJobStatus.RUNNING,
+            completed_steps=[],
+            current_step=PROVISIONING_STEPS[0],
+        )
+    )
+    await db.commit()
+    await db.refresh(tenant)
+    return tenant
+
+
+async def update_tenant(db: AsyncSession, tenant_id: uuid.UUID, payload: TenantUpdate) -> Tenant:
+    tenant = await get_tenant(db, tenant_id)
+    updates = payload.model_dump(exclude_unset=True)
+    for field, value in updates.items():
+        setattr(tenant, field, value)
+    await db.commit()
+    await db.refresh(tenant)
+    return tenant
+
+
+async def set_tenant_status(
+    db: AsyncSession, tenant_id: uuid.UUID, new_status: TenantStatus
+) -> Tenant:
+    tenant = await get_tenant(db, tenant_id)
+    tenant.status = new_status
+    await db.commit()
+    await db.refresh(tenant)
+    return tenant
+
+
+async def delete_tenant(db: AsyncSession, tenant_id: uuid.UUID) -> None:
+    tenant = await get_tenant(db, tenant_id)
+    await db.delete(tenant)
+    await db.commit()

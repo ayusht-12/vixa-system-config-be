@@ -31,6 +31,7 @@ class AuditLogEntryRead(BaseModel):
     prev_hash: str | None
     entry_hash: str
     signing_key_id: str
+    signature: str
     integrity: str  # "valid" — chain position, checked lazily on verify, not per-read
 
 

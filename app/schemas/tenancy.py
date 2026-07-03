@@ -3,6 +3,36 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from app.models.tenancy import IsolationMode, TenantTier
+
+
+class TenantCreate(BaseModel):
+    slug: str
+    org_id: str
+    display_name: str
+    tier: TenantTier
+    isolation_mode: IsolationMode = IsolationMode.STRICT
+    region: str
+    db_schema_name: str
+    network_cidr: str | None = None
+    network_vpc: str | None = None
+    network_shared: bool = False
+    dek_label: str | None = None
+
+
+class TenantUpdate(BaseModel):
+    display_name: str | None = None
+    tier: TenantTier | None = None
+    isolation_mode: IsolationMode | None = None
+    region: str | None = None
+    network_cidr: str | None = None
+    network_vpc: str | None = None
+    network_shared: bool | None = None
+    dek_label: str | None = None
+    db_schema_valid: bool | None = None
+    encryption_valid: bool | None = None
+    events_per_second: float | None = None
+
 
 class TenantRead(BaseModel):
     id: uuid.UUID

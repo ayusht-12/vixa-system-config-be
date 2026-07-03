@@ -1,6 +1,7 @@
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -228,6 +229,53 @@ async def update_anomaly_status(
     event.status = status_value
     if status_value == AnomalyStatus.RESOLVED:
         event.resolved_at = datetime.now(timezone.utc)
+    elif status_value == AnomalyStatus.OPEN:
+        event.resolved_at = None
     await db.commit()
     await db.refresh(event)
     return event
+
+
+async def get_anomaly_event(db: AsyncSession, event_id: uuid.UUID) -> AnomalyEvent:
+    event = await db.get(AnomalyEvent, event_id)
+    if event is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Anomaly not found")
+    return event
+
+
+async def list_anomaly_events(
+    db: AsyncSession,
+    *,
+    page: int,
+    page_size: int,
+    status_filter: AnomalyStatus | None = None,
+    severity_filter: AnomalySeverity | None = None,
+    category: str | None = None,
+    tenant_id: uuid.UUID | None = None,
+) -> tuple[list[AnomalyEventRead], int]:
+    query = select(AnomalyEvent)
+    count_query = select(func.count()).select_from(AnomalyEvent)
+
+    filters = []
+    if status_filter is not None:
+        filters.append(AnomalyEvent.status == status_filter)
+    if severity_filter is not None:
+        filters.append(AnomalyEvent.severity == severity_filter)
+    if category:
+        filters.append(AnomalyEvent.category == category)
+    if tenant_id is not None:
+        filters.append(AnomalyEvent.tenant_id == tenant_id)
+
+    for condition in filters:
+        query = query.where(condition)
+        count_query = count_query.where(condition)
+
+    total = (await db.execute(count_query)).scalar_one()
+
+    query = (
+        query.order_by(AnomalyEvent.occurred_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+    )
+    events = (await db.execute(query)).scalars().all()
+    return [AnomalyEventRead.model_validate(e) for e in events], total

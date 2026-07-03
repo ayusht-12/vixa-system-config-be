@@ -66,6 +66,7 @@ async def create_audit_entry(
         prev_hash=entry.prev_hash,
         entry_hash=entry.entry_hash,
         signing_key_id=entry.signing_key_id,
+        signature=entry.signature,
         integrity="valid",
     )
 

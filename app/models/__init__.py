@@ -25,11 +25,12 @@ from app.models.tenancy import (
     TenantProvisioningJob,
     TenantSchemaValidation,
 )
-from app.models.user import User
+from app.models.user import RefreshToken, User
 
 __all__ = [
     "Base",
     "User",
+    "RefreshToken",
     "EngineInstance",
     "SystemMetricSample",
     "EtcdNode",

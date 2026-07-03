@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "change-me-in-production-this-is-a-dev-only-secret"
     JWT_ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 8  # 8 hours
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
     # --- CORS ---
     CORS_ORIGINS: list[str] = [
