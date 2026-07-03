@@ -1,9 +1,39 @@
 import uuid
 from datetime import datetime
+from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 from app.schemas.common import ORMModel
+
+REDACTED_METADATA_VALUE = "[REDACTED]"
+SENSITIVE_METADATA_KEYS = {
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "credentials",
+    "password",
+    "private_key",
+    "refresh_token",
+    "secret",
+    "secret_key",
+    "token",
+}
+
+
+def redact_sensitive_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: REDACTED_METADATA_VALUE
+            if str(key).lower() in SENSITIVE_METADATA_KEYS
+            else redact_sensitive_metadata(nested_value)
+            for key, nested_value in value.items()
+        }
+    if isinstance(value, list):
+        return [redact_sensitive_metadata(item) for item in value]
+    return value
 
 
 class AnomalyEventRead(ORMModel):
@@ -19,6 +49,11 @@ class AnomalyEventRead(ORMModel):
     baseline_sigma: float | None
     metadata_json: dict
     occurred_at: datetime
+
+    @field_validator("metadata_json", mode="before")
+    @classmethod
+    def redact_metadata_json(cls, value: Any) -> Any:
+        return redact_sensitive_metadata(value)
 
 
 class AnomalyEventCreate(BaseModel):
