@@ -1,6 +1,7 @@
 import uuid
+from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from app.schemas.common import ORMModel
 
@@ -30,3 +31,31 @@ class UserRead(ORMModel):
     email: str
     display_name: str
     is_admin: bool
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str = Field(min_length=1)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class ForgotPasswordRequest(BaseModel):
+    email: str = Field(min_length=3)
+
+
+class ForgotPasswordResponse(BaseModel):
+    detail: str
+    # The raw reset token is surfaced only in non-production environments so the
+    # flow is testable without an email transport. It is never returned in
+    # production, where the token is expected to be delivered out-of-band.
+    reset_token: str | None = None
+
+
+class ResetPasswordRequest(BaseModel):
+    token: str = Field(min_length=1)
+    new_password: str = Field(min_length=8, max_length=128)
+
+
+class SessionRead(ORMModel):
+    id: uuid.UUID
+    created_at: datetime
+    expires_at: datetime

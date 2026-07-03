@@ -47,6 +47,7 @@ class MasterKeyStatus(str, enum.Enum):
     EXPIRING = "expiring"
     RETIRED = "retired"
     PENDING = "pending"
+    DISABLED = "disabled"
 
 
 class MasterKey(Base, TimestampMixin):
@@ -199,3 +200,97 @@ class AttestationRun(Base, TimestampMixin):
     @property
     def pass_count(self) -> int:
         return sum(1 for c in self.checks if c.get("passed"))
+
+
+class SecurityProviderType(str, enum.Enum):
+    PKCS11 = "pkcs11"
+    CLOUD_KMS = "cloud_kms"
+    SOFTWARE = "software"
+
+
+class SecurityProvider(Base, TimestampMixin):
+    """A configured cryptographic provider (a physical HSM, a cloud KMS, or a
+    software keystore). This table holds *non-secret* provider metadata and
+    operational telemetry only — never key material.
+    """
+
+    __tablename__ = "security_providers"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(80), unique=True, nullable=False)
+    provider_type: Mapped[SecurityProviderType] = mapped_column(
+        Enum(SecurityProviderType, native_enum=False, validate_strings=True), nullable=False
+    )
+    model: Mapped[str] = mapped_column(String(60), nullable=False)
+    manufacturer: Mapped[str] = mapped_column(String(60), nullable=False)
+    library_path: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    firmware_version: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    serial_number: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    fips_level: Mapped[str] = mapped_column(String(40), default="", nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    pool_active: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    pool_max: Mapped[int] = mapped_column(Integer, default=10, nullable=False)
+    connection_timeout_seconds: Mapped[int] = mapped_column(Integer, default=5, nullable=False)
+    avg_latency_ms: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    session_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    rw_session_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_count_24h: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    supported_mechanisms: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    last_health_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    @property
+    def pool_utilization_percent(self) -> float:
+        if self.pool_max <= 0:
+            return 0.0
+        return round(min(100.0, self.pool_active / self.pool_max * 100), 1)
+
+
+class SecurityOperationType(str, enum.Enum):
+    KEY_CREATE = "key_create"
+    KEY_ROTATE = "key_rotate"
+    KEY_DISABLE = "key_disable"
+    ATTESTATION_RUN = "attestation_run"
+    CEREMONY_COMPLETE = "ceremony_complete"
+
+
+class SecurityOperationStatus(str, enum.Enum):
+    SUCCESS = "success"
+    FAILED = "failed"
+
+
+class SecurityOperation(Base, TimestampMixin):
+    """Append-only history of security/key lifecycle operations performed
+    through the provider abstraction (create / rotate / disable / attest).
+
+    ``key_label`` is denormalized so an operation's history is preserved even
+    after the referenced master key is deleted (the FK is SET NULL).
+    """
+
+    __tablename__ = "security_operations"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    operation_type: Mapped[SecurityOperationType] = mapped_column(
+        Enum(SecurityOperationType, native_enum=False, validate_strings=True),
+        nullable=False,
+        index=True,
+    )
+    master_key_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("master_keys.id", ondelete="SET NULL"), nullable=True
+    )
+    key_label: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    actor: Mapped[str] = mapped_column(String(120), nullable=False)
+    status: Mapped[SecurityOperationStatus] = mapped_column(
+        Enum(SecurityOperationStatus, native_enum=False, validate_strings=True),
+        default=SecurityOperationStatus.SUCCESS,
+        nullable=False,
+    )
+    detail: Mapped[str] = mapped_column(String(300), nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )

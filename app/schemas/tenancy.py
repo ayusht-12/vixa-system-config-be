@@ -3,7 +3,7 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
-from app.models.tenancy import IsolationMode, TenantTier
+from app.models.tenancy import IsolationMode, TenantMemberRole, TenantTier
 
 
 class TenantCreate(BaseModel):
@@ -121,3 +121,34 @@ class TenancyOverview(BaseModel):
     schema_validations: list[TenantSchemaValidationRead]
     backup_snapshots: list[BackupSnapshotRead]
     total_events_per_second: float
+
+
+class TenantMemberCreate(BaseModel):
+    user_id: uuid.UUID
+    role: TenantMemberRole = TenantMemberRole.VIEWER
+
+
+class TenantMemberRead(BaseModel):
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    user_id: uuid.UUID
+    email: str
+    display_name: str
+    role: str
+    created_at: datetime
+
+
+class TenantUsageSummary(BaseModel):
+    tenant_id: uuid.UUID
+    slug: str
+    display_name: str
+    status: str
+    member_count: int
+    events_per_second: float
+    provisioning_jobs_total: int
+    active_provisioning_jobs: int
+    schema_validations_total: int
+    backup_snapshots_total: int
+    current_backup_snapshots: int
+    isolation_score: float
+    isolation_level: str

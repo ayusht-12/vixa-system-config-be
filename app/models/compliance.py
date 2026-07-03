@@ -2,7 +2,17 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, Float, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    Enum,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -129,3 +139,62 @@ class SchemaValidationResult(Base, TimestampMixin):
     tenant_slug: Mapped[str | None] = mapped_column(String(80), nullable=True)
     reference_id: Mapped[str | None] = mapped_column(String(60), nullable=True)
     validated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AssessmentStatus(str, enum.Enum):
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+
+
+class ComplianceAssessment(Base, TimestampMixin):
+    """A point-in-time control assessment run against one framework. Started in
+    IN_PROGRESS and finalized via complete(), which snapshots the control
+    coverage counts and score at completion time."""
+
+    __tablename__ = "compliance_assessments"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    framework_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("compliance_frameworks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    status: Mapped[AssessmentStatus] = mapped_column(
+        Enum(AssessmentStatus, native_enum=False, validate_strings=True),
+        default=AssessmentStatus.IN_PROGRESS,
+        nullable=False,
+    )
+    started_by: Mapped[str] = mapped_column(String(255), nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    score: Mapped[float | None] = mapped_column(Float, nullable=True)
+    total_controls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    mapped_controls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    gap_controls: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    notes: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    framework: Mapped[ComplianceFramework] = relationship()
+
+
+class ComplianceScoreSnapshot(Base, TimestampMixin):
+    """A recorded compliance score for one framework at a point in time. The
+    series of these forms the score-trend history shown on the dashboard."""
+
+    __tablename__ = "compliance_score_snapshots"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    framework_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("compliance_frameworks.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    score: Mapped[float] = mapped_column(Float, nullable=False)
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    framework: Mapped[ComplianceFramework] = relationship()

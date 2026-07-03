@@ -9,6 +9,7 @@ from app.api.v1.endpoints import (
     dashboard,
     engine,
     hsm,
+    system,
     tenancy,
 )
 
@@ -22,3 +23,4 @@ api_router.include_router(audit_log.router, prefix="/audit-log", tags=["audit-lo
 api_router.include_router(hsm.router, prefix="/hsm", tags=["hsm-security"])
 api_router.include_router(tenancy.router, prefix="/tenancy", tags=["tenancy"])
 api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
+api_router.include_router(system.router, prefix="/system", tags=["system"])

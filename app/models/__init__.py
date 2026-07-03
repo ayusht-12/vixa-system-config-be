@@ -2,7 +2,9 @@ from app.db.base_class import Base
 from app.models.anomaly import AnomalyEvent, BehavioralBaseline, Incident
 from app.models.audit import AuditLogEntry
 from app.models.compliance import (
+    ComplianceAssessment,
     ComplianceFramework,
+    ComplianceScoreSnapshot,
     ComplianceViolation,
     ControlMapping,
     SchemaValidationResult,
@@ -17,20 +19,24 @@ from app.models.hsm import (
     KeyCeremony,
     KeyCustodianApproval,
     MasterKey,
+    SecurityOperation,
+    SecurityProvider,
 )
 from app.models.tenancy import (
     BreachAlert,
     Tenant,
     TenantBackupSnapshot,
+    TenantMember,
     TenantProvisioningJob,
     TenantSchemaValidation,
 )
-from app.models.user import RefreshToken, User
+from app.models.user import PasswordResetToken, RefreshToken, User
 
 __all__ = [
     "Base",
     "User",
     "RefreshToken",
+    "PasswordResetToken",
     "EngineInstance",
     "SystemMetricSample",
     "EtcdNode",
@@ -42,6 +48,8 @@ __all__ = [
     "ControlMapping",
     "ComplianceViolation",
     "SchemaValidationResult",
+    "ComplianceAssessment",
+    "ComplianceScoreSnapshot",
     "ConfigParameter",
     "ConfigChange",
     "AuditLogEntry",
@@ -52,7 +60,10 @@ __all__ = [
     "Certificate",
     "CryptoAlgorithm",
     "AttestationRun",
+    "SecurityProvider",
+    "SecurityOperation",
     "Tenant",
+    "TenantMember",
     "BreachAlert",
     "TenantProvisioningJob",
     "TenantSchemaValidation",

@@ -1,16 +1,37 @@
 import uuid
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_db, require_admin
+from app.models.hsm import MasterKeyStatus, SecurityOperationType
 from app.models.user import User
-from app.schemas.hsm import AttestationRunRead, HsmOverview, KeyCeremonyRead
+from app.schemas.hsm import (
+    AttestationRunRead,
+    HsmOverview,
+    KeyCeremonyRead,
+    MasterKeyCreate,
+    MasterKeyRead,
+    MasterKeyRotateRequest,
+    SecurityHealth,
+    SecurityOperationRead,
+    SecurityProviderRead,
+    SecuritySummary,
+)
 from app.services.hsm_service import (
     approve_ceremony,
     attestation_run_to_read,
     complete_ceremony,
+    create_key,
+    disable_key,
     get_hsm_overview,
+    get_key,
+    get_security_health,
+    get_security_summary,
+    list_keys,
+    list_operations,
+    list_providers,
+    rotate_key,
     run_attestation,
 )
 
@@ -84,3 +105,84 @@ async def trigger_attestation_run(
 ) -> AttestationRunRead:
     run = await run_attestation(db)
     return attestation_run_to_read(run)
+
+
+@router.get("/summary", response_model=SecuritySummary)
+async def read_security_summary(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> SecuritySummary:
+    return await get_security_summary(db, module_serial=_MODULE_SERIAL)
+
+
+@router.get("/keys", response_model=list[MasterKeyRead])
+async def read_keys(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+    status_filter: MasterKeyStatus | None = Query(default=None, alias="status"),
+) -> list[MasterKeyRead]:
+    return await list_keys(db, key_status=status_filter)
+
+
+@router.post("/keys", response_model=MasterKeyRead, status_code=201)
+async def register_key(
+    payload: MasterKeyCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> MasterKeyRead:
+    return await create_key(db, payload, actor=current_user.email)
+
+
+@router.get("/keys/{key_id}", response_model=MasterKeyRead)
+async def read_key(
+    key_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> MasterKeyRead:
+    return await get_key(db, key_id)
+
+
+@router.post("/keys/{key_id}/rotate", response_model=MasterKeyRead)
+async def rotate_master_key(
+    key_id: uuid.UUID,
+    payload: MasterKeyRotateRequest | None = None,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> MasterKeyRead:
+    new_label = payload.new_label if payload else None
+    return await rotate_key(db, key_id, actor=current_user.email, new_label=new_label)
+
+
+@router.post("/keys/{key_id}/disable", response_model=MasterKeyRead)
+async def disable_master_key(
+    key_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> MasterKeyRead:
+    return await disable_key(db, key_id, actor=current_user.email)
+
+
+@router.get("/operations", response_model=list[SecurityOperationRead])
+async def read_operations(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+    operation_type: SecurityOperationType | None = Query(default=None, alias="type"),
+    limit: int = Query(default=50, ge=1, le=200),
+) -> list[SecurityOperationRead]:
+    return await list_operations(db, operation_type=operation_type, limit=limit)
+
+
+@router.get("/providers", response_model=list[SecurityProviderRead])
+async def read_providers(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> list[SecurityProviderRead]:
+    return await list_providers(db)
+
+
+@router.get("/health", response_model=SecurityHealth)
+async def read_security_health(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> SecurityHealth:
+    return await get_security_health(db)
