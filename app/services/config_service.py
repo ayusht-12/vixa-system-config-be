@@ -15,7 +15,7 @@ from app.schemas.config import (
     ConfigParameterStage,
     ConfigTierSummary,
 )
-from app.services.audit_service import append_entry
+from app.services.audit_service import append_entry_in_transaction
 
 
 def _validate_value(parameter: ConfigParameter, value: str) -> None:
@@ -93,51 +93,51 @@ async def apply_pending_changes(db: AsyncSession, changed_by: str = "admin@nexus
     write one audit-log entry per applied parameter — config mutations are
     exactly the kind of event the immutable log exists to capture.
     """
-    result = await db.execute(
-        select(ConfigParameter).where(ConfigParameter.pending_value.is_not(None))
-    )
-    parameters = result.scalars().all()
-
     applied_count = 0
-    for parameter in parameters:
-        pending_changes = await db.execute(
-            select(ConfigChange).where(
-                ConfigChange.parameter_id == parameter.id,
-                ConfigChange.status == ConfigChangeStatus.PENDING,
+    async with db.begin():
+        result = await db.execute(
+            select(ConfigParameter).where(ConfigParameter.pending_value.is_not(None))
+        )
+        parameters = result.scalars().all()
+
+        for parameter in parameters:
+            pending_changes = await db.execute(
+                select(ConfigChange).where(
+                    ConfigChange.parameter_id == parameter.id,
+                    ConfigChange.status == ConfigChangeStatus.PENDING,
+                )
             )
-        )
-        change = pending_changes.scalars().first()
+            change = pending_changes.scalars().first()
 
-        previous_value = parameter.active_value
-        parameter.active_value = parameter.pending_value
-        parameter.pending_value = None
+            previous_value = parameter.active_value
+            parameter.active_value = parameter.pending_value
+            parameter.pending_value = None
 
-        if change:
-            change.status = ConfigChangeStatus.APPLIED
-            change.applied_at = datetime.now(timezone.utc)
+            if change:
+                change.status = ConfigChangeStatus.APPLIED
+                change.applied_at = datetime.now(timezone.utc)
 
-        await append_entry(
-            db,
-            AuditLogEntryCreate(
-                severity="info",
-                event_type="config_change",
-                event_subtype="PARAMETER_UPDATED",
-                actor=changed_by,
-                description=(
-                    f"Config parameter '{parameter.key}' updated: "
-                    f"{previous_value!r} -> {parameter.active_value!r}"
+            await append_entry_in_transaction(
+                db,
+                AuditLogEntryCreate(
+                    severity="info",
+                    event_type="config_change",
+                    event_subtype="PARAMETER_UPDATED",
+                    actor=changed_by,
+                    description=(
+                        f"Config parameter '{parameter.key}' updated: "
+                        f"{previous_value!r} -> {parameter.active_value!r}"
+                    ),
+                    metadata_json={
+                        "parameter_key": parameter.key,
+                        "previous_value": previous_value,
+                        "new_value": parameter.active_value,
+                        "requires_restart": parameter.requires_restart,
+                    },
                 ),
-                metadata_json={
-                    "parameter_key": parameter.key,
-                    "previous_value": previous_value,
-                    "new_value": parameter.active_value,
-                    "requires_restart": parameter.requires_restart,
-                },
-            ),
-        )
-        applied_count += 1
+            )
+            applied_count += 1
 
-    await db.commit()
     return applied_count
 
 

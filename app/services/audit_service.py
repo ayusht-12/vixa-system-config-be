@@ -90,15 +90,10 @@ async def _get_tail(db: AsyncSession) -> AuditLogEntry | None:
     return result.scalar_one_or_none()
 
 
-async def append_entry(db: AsyncSession, payload: AuditLogEntryCreate) -> AuditLogEntry:
-    """Append one entry to the hash chain.
-
-    Note this deliberately does *not* run inside a caller-supplied
-    transaction that might be rolled back after the hash is computed —
-    each call commits its own entry so `prev_hash` linkage always reflects
-    what's durably persisted, even under concurrent appends serialized by
-    Postgres row locking on the sequence.
-    """
+async def append_entry_in_transaction(
+    db: AsyncSession, payload: AuditLogEntryCreate
+) -> AuditLogEntry:
+    """Append one entry using the caller's active transaction."""
     tail = await _get_tail(db)
     prev_hash = tail.entry_hash if tail else None
     occurred_at = datetime.now(timezone.utc)
@@ -137,6 +132,14 @@ async def append_entry(db: AsyncSession, payload: AuditLogEntryCreate) -> AuditL
         created_at=occurred_at,
     )
     db.add(entry)
+    await db.flush()
+    await db.refresh(entry)
+    return entry
+
+
+async def append_entry(db: AsyncSession, payload: AuditLogEntryCreate) -> AuditLogEntry:
+    """Append one entry to the hash chain and commit it as a standalone audit write."""
+    entry = await append_entry_in_transaction(db, payload)
     await db.commit()
     await db.refresh(entry)
     return entry
