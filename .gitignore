@@ -1,0 +1,27 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Signing keys / generated secrets
+var/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.ruff_cache/
+
+# Virtualenv
+.venv/
+venv/
+
+# Postgres data (if run locally outside Docker)
+pgdata/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

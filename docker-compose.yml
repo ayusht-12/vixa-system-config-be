@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-vscbe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-vscbe_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-vsc_be}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - vsc-be-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vscbe} -d ${POSTGRES_DB:-vsc_be}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+    ports:
+      - "8000:8000"
+    volumes:
+      - vsc-be-var:/srv/app/var
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  vsc-be-pgdata:
+  vsc-be-var:
