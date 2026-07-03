@@ -3,6 +3,7 @@ import json
 import time
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -15,6 +16,22 @@ from app.schemas.audit import (
     ChainVerificationResult,
     HashChainSummary,
 )
+
+REDACTED_METADATA_VALUE = "[REDACTED]"
+SENSITIVE_METADATA_KEYS = {
+    "access_token",
+    "api_key",
+    "apikey",
+    "authorization",
+    "credential",
+    "credentials",
+    "password",
+    "private_key",
+    "refresh_token",
+    "secret",
+    "secret_key",
+    "token",
+}
 
 
 def _canonical_payload(
@@ -53,6 +70,19 @@ def compute_entry_hash(**fields) -> str:
     return hashlib.sha256(_canonical_payload(**fields)).hexdigest()
 
 
+def sanitize_metadata(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: REDACTED_METADATA_VALUE
+            if str(key).lower() in SENSITIVE_METADATA_KEYS
+            else sanitize_metadata(nested_value)
+            for key, nested_value in value.items()
+        }
+    if isinstance(value, list):
+        return [sanitize_metadata(item) for item in value]
+    return value
+
+
 async def _get_tail(db: AsyncSession) -> AuditLogEntry | None:
     result = await db.execute(
         select(AuditLogEntry).order_by(AuditLogEntry.sequence.desc()).limit(1)
@@ -72,6 +102,7 @@ async def append_entry(db: AsyncSession, payload: AuditLogEntryCreate) -> AuditL
     tail = await _get_tail(db)
     prev_hash = tail.entry_hash if tail else None
     occurred_at = datetime.now(timezone.utc)
+    metadata_json = sanitize_metadata(payload.metadata_json)
 
     entry_hash = compute_entry_hash(
         prev_hash=prev_hash,
@@ -83,7 +114,7 @@ async def append_entry(db: AsyncSession, payload: AuditLogEntryCreate) -> AuditL
         description=payload.description,
         tenant_slug=payload.tenant_slug,
         source_ip=payload.source_ip,
-        metadata_json=payload.metadata_json,
+        metadata_json=metadata_json,
     )
     signature = sign_hex_digest(entry_hash)
 
@@ -98,7 +129,7 @@ async def append_entry(db: AsyncSession, payload: AuditLogEntryCreate) -> AuditL
         actor=payload.actor,
         source_ip=payload.source_ip,
         description=payload.description,
-        metadata_json=payload.metadata_json,
+        metadata_json=metadata_json,
         prev_hash=prev_hash,
         entry_hash=entry_hash,
         signing_key_id=get_signing_key_id(),
