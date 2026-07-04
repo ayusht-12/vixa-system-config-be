@@ -17,6 +17,8 @@ from app.schemas.config import (
 )
 from app.services.audit_service import append_entry_in_transaction
 
+_REDACTED_CONFIG_VALUE = "[REDACTED]"
+
 
 def _validate_value(parameter: ConfigParameter, value: str) -> None:
     if parameter.value_type.value == "enum" and parameter.allowed_values:
@@ -94,7 +96,7 @@ async def apply_pending_changes(db: AsyncSession, changed_by: str = "admin@nexus
     exactly the kind of event the immutable log exists to capture.
     """
     applied_count = 0
-    async with db.begin():
+    try:
         result = await db.execute(
             select(ConfigParameter).where(ConfigParameter.pending_value.is_not(None))
         )
@@ -112,6 +114,12 @@ async def apply_pending_changes(db: AsyncSession, changed_by: str = "admin@nexus
             previous_value = parameter.active_value
             parameter.active_value = parameter.pending_value
             parameter.pending_value = None
+            audit_previous_value = (
+                _REDACTED_CONFIG_VALUE if parameter.is_sensitive else previous_value
+            )
+            audit_new_value = (
+                _REDACTED_CONFIG_VALUE if parameter.is_sensitive else parameter.active_value
+            )
 
             if change:
                 change.status = ConfigChangeStatus.APPLIED
@@ -126,17 +134,22 @@ async def apply_pending_changes(db: AsyncSession, changed_by: str = "admin@nexus
                     actor=changed_by,
                     description=(
                         f"Config parameter '{parameter.key}' updated: "
-                        f"{previous_value!r} -> {parameter.active_value!r}"
+                        f"{audit_previous_value!r} -> {audit_new_value!r}"
                     ),
                     metadata_json={
                         "parameter_key": parameter.key,
-                        "previous_value": previous_value,
-                        "new_value": parameter.active_value,
+                        "previous_value": audit_previous_value,
+                        "new_value": audit_new_value,
                         "requires_restart": parameter.requires_restart,
                     },
                 ),
             )
             applied_count += 1
+
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
 
     return applied_count
 
