@@ -98,6 +98,11 @@ API is available at `http://localhost:8000`, interactive docs at
 ## Auth
 
 All endpoints except `/health` and `/api/v1/auth/*` require a bearer token.
+Access tokens use an HMAC JWT algorithm allowlist (`HS256`, `HS384`, `HS512`).
+In production (`ENVIRONMENT=production`, `prod`, or `release`) startup rejects
+`DEBUG=true` and development/default JWT secrets. Refresh tokens are stored as
+hashes, rotate on redemption, and expiry checks handle both timezone-aware and
+naive PostgreSQL datetimes.
 
 **Demo credentials** (created by `scripts/seed_data.py` — change them before deploying anywhere real):
 
@@ -132,7 +137,26 @@ Mounted under `/api/v1`:
 | `/hsm`           | HSM Security (keys, ceremonies, attestation) |
 | `/tenancy`       | Tenancy Orchestration (isolation, provisioning) |
 
-Full request/response schemas are in the OpenAPI docs at `/api/v1/docs`.
+Current generated OpenAPI inventory: 36 paths and 41 HTTP operations. Full
+request/response schemas are in the OpenAPI docs at `/api/v1/docs`; a concise
+endpoint count is maintained in `docs/API_INVENTORY.md`.
+
+Tenant-aware endpoints expose explicit tenant filters where implemented. The
+backend does not claim implicit tenant isolation for every request.
+
+## Security and integrity notes
+
+- Anomaly API responses recursively redact sensitive metadata keys at any
+  nesting depth without mutating stored anomaly metadata.
+- Audit metadata is recursively sanitized before the canonical hash payload,
+  previous-hash linkage, ECDSA signature, and database insert are produced.
+- Audit entries are SHA-256 hash-chained, signed with ECDSA P-384, and protected
+  by a PostgreSQL trigger that rejects `UPDATE` and `DELETE` on the audit table.
+- Config apply and audited anomaly mutations use one transaction for the domain
+  mutation plus audit append. Audit failures roll back the domain mutation, and
+  failed domain mutations leave no audit row.
+- Sensitive config values marked `is_sensitive` are masked in config API
+  responses and redacted from config audit descriptions/metadata.
 
 ## Migrations
 
@@ -146,11 +170,20 @@ Note: `alembic/versions/*_audit_log_immutability_trigger.py` and
 (trigger DDL and an `IDENTITY` column conversion) — autogenerate can't produce
 either of those correctly, so don't regenerate over them.
 
+Current migration head: `20260703_1400_4bb68c116149_add_refresh_tokens.py`
+(`4bb68c116149`).
+
 ## Tests
 
 ```bash
 pytest
 ```
 
-Covers the health check, the JWT auth flow, and audit-log hash-chain
-verification (including tamper detection).
+The suite is PostgreSQL-backed because the schema uses PostgreSQL UUID, JSON,
+identity sequence, and trigger behavior. It covers health, JWT auth hardening,
+refresh-token hashing/rotation/expiry, recursive anomaly redaction, audit
+metadata sanitization, hash-chain/ECDSA verification, config/audit atomicity,
+anomaly/audit atomicity, and cross-module integration.
+
+See `docs/ARCHITECTURE.md` for transaction ownership, audit integrity, and
+known limitations.

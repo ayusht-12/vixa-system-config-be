@@ -6,6 +6,13 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 DEFAULT_SECRET_KEY = "change-me-in-production-this-is-a-dev-only-secret"
+INSECURE_SECRET_KEYS = {
+    DEFAULT_SECRET_KEY,
+    "change-me",
+    "change-me-in-production",
+    "changeme",
+    "secret",
+}
 ALLOWED_JWT_ALGORITHMS = {"HS256", "HS384", "HS512"}
 
 
@@ -74,7 +81,7 @@ class Settings(BaseSettings):
         if environment in {"production", "prod", "release"}:
             if self.DEBUG:
                 raise ValueError("DEBUG must be disabled in production")
-            if self.SECRET_KEY.strip() in {DEFAULT_SECRET_KEY, "change-me", "changeme", "secret"}:
+            if self.SECRET_KEY.strip() in INSECURE_SECRET_KEYS:
                 raise ValueError("SECRET_KEY must be set to a secure value in production")
         return self
 

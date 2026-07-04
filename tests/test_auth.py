@@ -85,6 +85,13 @@ async def test_production_rejects_insecure_settings() -> None:
     with pytest.raises(ValidationError, match="SECRET_KEY"):
         Settings(ENVIRONMENT="production", DEBUG=False)
 
+    with pytest.raises(ValidationError, match="SECRET_KEY"):
+        Settings(
+            ENVIRONMENT="production",
+            DEBUG=False,
+            SECRET_KEY="change-me-in-production",
+        )
+
     with pytest.raises(ValidationError, match="DEBUG"):
         Settings(ENVIRONMENT="production", DEBUG=True, SECRET_KEY="a-secure-production-secret")
 
