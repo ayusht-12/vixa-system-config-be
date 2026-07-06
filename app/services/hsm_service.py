@@ -32,6 +32,7 @@ from app.schemas.hsm import (
     CustodianApprovalRead,
     HsmOverview,
     HsmSlotRead,
+    KeyCeremonyCreate,
     KeyCeremonyRead,
     MasterKeyCreate,
     MasterKeyRead,
@@ -42,7 +43,7 @@ from app.schemas.hsm import (
     SecurityProviderRead,
     SecuritySummary,
 )
-from app.services.audit_service import append_entry
+from app.services.audit_service import append_entry_in_transaction
 
 _EXPIRING_WITHIN_DAYS = 30
 # A slot is flagged "near capacity" for posture reporting at 85%, but only a
@@ -89,6 +90,25 @@ def _certificate_status(cert: Certificate, now: datetime) -> str:
     if (cert.expires_at - now).days <= _EXPIRING_WITHIN_DAYS:
         return "expiring"
     return "valid"
+
+
+def ceremony_to_read(c: KeyCeremony) -> KeyCeremonyRead:
+    return KeyCeremonyRead(
+        id=c.id,
+        ceremony_ref=c.ceremony_ref,
+        master_key_label=c.master_key.key_label,
+        predecessor_label=c.predecessor_label,
+        required_approvals=c.required_approvals,
+        approval_count=c.approval_count,
+        quorum_met=c.quorum_met,
+        status=c.status.value,
+        scheduled_at=c.scheduled_at,
+        completed_at=c.completed_at,
+        approvals=[
+            CustodianApprovalRead(custodian_email=a.custodian_email, approved_at=a.approved_at)
+            for a in c.approvals
+        ],
+    )
 
 
 async def _slots(db: AsyncSession) -> list[HsmSlotRead]:
@@ -145,25 +165,7 @@ async def _ceremonies(db: AsyncSession) -> list[KeyCeremonyRead]:
         .order_by(KeyCeremony.created_at.desc())
     )
     ceremonies = result.scalars().all()
-    return [
-        KeyCeremonyRead(
-            id=c.id,
-            ceremony_ref=c.ceremony_ref,
-            master_key_label=c.master_key.key_label,
-            predecessor_label=c.predecessor_label,
-            required_approvals=c.required_approvals,
-            approval_count=c.approval_count,
-            quorum_met=c.quorum_met,
-            status=c.status.value,
-            scheduled_at=c.scheduled_at,
-            completed_at=c.completed_at,
-            approvals=[
-                CustodianApprovalRead(custodian_email=a.custodian_email, approved_at=a.approved_at)
-                for a in c.approvals
-            ],
-        )
-        for c in ceremonies
-    ]
+    return [ceremony_to_read(c) for c in ceremonies]
 
 
 async def _certificates(db: AsyncSession) -> list[CertificateRead]:
@@ -233,33 +235,135 @@ async def get_hsm_overview(db: AsyncSession, module_serial: str) -> HsmOverview:
     )
 
 
+async def create_ceremony(
+    db: AsyncSession, payload: KeyCeremonyCreate, actor: str
+) -> KeyCeremony:
+    target_key = await _get_key_orm(db, payload.master_key_id)
+    if target_key.status != MasterKeyStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Ceremonies can only be initiated for pending keys (key is {target_key.status.value})",
+        )
+
+    predecessor: MasterKey | None = None
+    if payload.predecessor_key_id is not None:
+        if payload.predecessor_key_id == payload.master_key_id:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Predecessor key must be different from the pending key",
+            )
+        predecessor = await _get_key_orm(db, payload.predecessor_key_id)
+        if predecessor.status not in (MasterKeyStatus.ACTIVE, MasterKeyStatus.EXPIRING):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "Predecessor key must be active or expiring "
+                    f"(key is {predecessor.status.value})"
+                ),
+            )
+
+    duplicate = await db.execute(
+        select(KeyCeremony.id).where(
+            KeyCeremony.master_key_id == target_key.id,
+            KeyCeremony.status == CeremonyStatus.PENDING,
+        )
+    )
+    if duplicate.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A pending ceremony already exists for this key",
+        )
+
+    now = datetime.now(timezone.utc)
+    ceremony = KeyCeremony(
+        id=uuid.uuid4(),
+        ceremony_ref=f"CER-{now.strftime('%Y%m%d')}-{uuid.uuid4().hex[:8].upper()}",
+        master_key_id=target_key.id,
+        predecessor_label=predecessor.key_label if predecessor else None,
+        required_approvals=payload.required_approvals,
+        status=CeremonyStatus.PENDING,
+        scheduled_at=payload.scheduled_at,
+    )
+    db.add(ceremony)
+    await db.flush()
+
+    await append_entry_in_transaction(
+        db,
+        AuditLogEntryCreate(
+            severity="info",
+            event_type="key_operation",
+            event_subtype="KEY_CEREMONY_INITIATED",
+            actor=actor,
+            description=f"Initiated key ceremony {ceremony.ceremony_ref} for {target_key.key_label}",
+            metadata_json={
+                "ceremony_ref": ceremony.ceremony_ref,
+                "master_key_id": str(target_key.id),
+                "master_key_label": target_key.key_label,
+                "predecessor_label": ceremony.predecessor_label,
+                "required_approvals": ceremony.required_approvals,
+            },
+        ),
+    )
+    await db.commit()
+    result = await db.execute(
+        select(KeyCeremony)
+        .options(selectinload(KeyCeremony.approvals), selectinload(KeyCeremony.master_key))
+        .where(KeyCeremony.id == ceremony.id)
+    )
+    return result.scalar_one()
+
+
 async def approve_ceremony(
     db: AsyncSession, ceremony_id: uuid.UUID, custodian_email: str
 ) -> KeyCeremony:
     result = await db.execute(
         select(KeyCeremony)
-        .options(selectinload(KeyCeremony.approvals))
+        .options(selectinload(KeyCeremony.approvals), selectinload(KeyCeremony.master_key))
         .where(KeyCeremony.id == ceremony_id)
     )
     ceremony = result.scalar_one_or_none()
     if ceremony is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ceremony not found")
+    if ceremony.status != CeremonyStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Ceremony is already {ceremony.status.value}",
+        )
 
     approval = next(
         (a for a in ceremony.approvals if a.custodian_email == custodian_email), None
     )
+    already_approved = approval is not None and approval.approved_at is not None
     if approval is None:
         approval = KeyCustodianApproval(ceremony_id=ceremony.id, custodian_email=custodian_email)
         db.add(approval)
         ceremony.approvals.append(approval)
 
-    approval.approved_at = datetime.now(timezone.utc)
+    if not already_approved:
+        approval.approved_at = datetime.now(timezone.utc)
+        await append_entry_in_transaction(
+            db,
+            AuditLogEntryCreate(
+                severity="info",
+                event_type="key_operation",
+                event_subtype="KEY_CEREMONY_APPROVED",
+                actor=custodian_email,
+                description=f"Approved key ceremony {ceremony.ceremony_ref}",
+                metadata_json={
+                    "ceremony_ref": ceremony.ceremony_ref,
+                    "master_key_id": str(ceremony.master_key_id),
+                    "master_key_label": ceremony.master_key.key_label,
+                    "approval_count": ceremony.approval_count,
+                    "required_approvals": ceremony.required_approvals,
+                },
+            ),
+        )
     await db.commit()
-    await db.refresh(ceremony, attribute_names=["approvals"])
+    await db.refresh(ceremony, attribute_names=["approvals", "master_key"])
     return ceremony
 
 
-async def complete_ceremony(db: AsyncSession, ceremony_id: uuid.UUID) -> KeyCeremony:
+async def complete_ceremony(db: AsyncSession, ceremony_id: uuid.UUID, actor: str) -> KeyCeremony:
     """Finalize a ceremony once quorum is met — rotates the master key.
 
     This is the one action in the HSM domain with real cross-entity side
@@ -277,6 +381,11 @@ async def complete_ceremony(db: AsyncSession, ceremony_id: uuid.UUID) -> KeyCere
     ceremony = result.scalar_one_or_none()
     if ceremony is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Ceremony not found")
+    if ceremony.status != CeremonyStatus.PENDING:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Ceremony is already {ceremony.status.value}",
+        )
     if not ceremony.quorum_met:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
@@ -303,13 +412,22 @@ async def complete_ceremony(db: AsyncSession, ceremony_id: uuid.UUID) -> KeyCere
     ceremony.status = ceremony.status.__class__.COMPLETE
     ceremony.completed_at = now
 
-    await append_entry(
+    _record_operation(
+        db,
+        operation_type=SecurityOperationType.CEREMONY_COMPLETE,
+        key=new_key,
+        actor=actor,
+        detail=f"Completed ceremony {ceremony.ceremony_ref}",
+        occurred_at=now,
+    )
+
+    await append_entry_in_transaction(
         db,
         AuditLogEntryCreate(
             severity="info",
             event_type="key_operation",
             event_subtype="KEY_ROTATION_COMPLETE",
-            actor="engine-core",
+            actor=actor,
             description=(
                 f"{ceremony.predecessor_label or 'new key'} -> {new_key.key_label} "
                 f"rotation completed via ceremony {ceremony.ceremony_ref}"
@@ -323,11 +441,11 @@ async def complete_ceremony(db: AsyncSession, ceremony_id: uuid.UUID) -> KeyCere
     )
 
     await db.commit()
-    await db.refresh(ceremony)
+    await db.refresh(ceremony, attribute_names=["approvals", "master_key"])
     return ceremony
 
 
-async def run_attestation(db: AsyncSession) -> AttestationRun:
+async def run_attestation(db: AsyncSession, actor: str) -> AttestationRun:
     """Executes the fixed FIPS 140-3 self-test suite.
 
     These are the same checks a real HSM firmware runs on a POST
@@ -345,11 +463,35 @@ async def run_attestation(db: AsyncSession) -> AttestationRun:
         {"key": "attest_chain", "label": "Attest Chain", "passed": True, "detail": "3-cert chain valid"},
     ]
     run = AttestationRun(
+        id=uuid.uuid4(),
         ran_at=datetime.now(timezone.utc),
         checks=checks,
         all_passed=all(c["passed"] for c in checks),
     )
     db.add(run)
+    _record_operation(
+        db,
+        operation_type=SecurityOperationType.ATTESTATION_RUN,
+        key=None,
+        actor=actor,
+        detail="Executed hardware attestation checks",
+        occurred_at=run.ran_at,
+    )
+    await append_entry_in_transaction(
+        db,
+        AuditLogEntryCreate(
+            severity="info",
+            event_type="key_operation",
+            event_subtype="HSM_ATTESTATION_RUN",
+            actor=actor,
+            description="Executed HSM attestation checks",
+            metadata_json={
+                "attestation_run_id": str(run.id),
+                "all_passed": run.all_passed,
+                "check_count": len(checks),
+            },
+        ),
+    )
     await db.commit()
     await db.refresh(run)
     return run
@@ -465,6 +607,23 @@ async def create_key(
         detail=f"Registered key reference {key.key_label} ({key.algorithm}) — pending ceremony",
         occurred_at=now,
     )
+    await append_entry_in_transaction(
+        db,
+        AuditLogEntryCreate(
+            severity="info",
+            event_type="key_operation",
+            event_subtype="KEY_REFERENCE_REGISTERED",
+            actor=actor,
+            description=f"Registered key reference {key.key_label}",
+            metadata_json={
+                "master_key_id": str(key.id),
+                "key_label": key.key_label,
+                "algorithm": key.algorithm,
+                "slot_id": str(key.slot_id) if key.slot_id else None,
+                "rotation_policy_days": key.rotation_policy_days,
+            },
+        ),
+    )
     await db.commit()
     return await get_key(db, key.id)
 
@@ -519,6 +678,23 @@ async def rotate_key(
         ),
         occurred_at=now,
     )
+    await append_entry_in_transaction(
+        db,
+        AuditLogEntryCreate(
+            severity="info",
+            event_type="key_operation",
+            event_subtype="KEY_ROTATED",
+            actor=actor,
+            description=f"Rotated {key.key_label} to {successor.key_label}",
+            metadata_json={
+                "predecessor_key_id": str(key.id),
+                "predecessor_label": key.key_label,
+                "successor_key_id": str(successor.id),
+                "successor_label": successor.key_label,
+                "wraps_dek_count": successor.wraps_dek_count,
+            },
+        ),
+    )
     await db.commit()
     return await get_key(db, successor.id)
 
@@ -532,6 +708,7 @@ async def disable_key(db: AsyncSession, key_id: uuid.UUID, actor: str) -> Master
         )
 
     now = datetime.now(timezone.utc)
+    previous_status = key.status.value
     key.status = MasterKeyStatus.DISABLED
     key.retired_at = now
     key.throughput_ops = 0.0
@@ -542,6 +719,21 @@ async def disable_key(db: AsyncSession, key_id: uuid.UUID, actor: str) -> Master
         actor=actor,
         detail=f"Disabled key {key.key_label}",
         occurred_at=now,
+    )
+    await append_entry_in_transaction(
+        db,
+        AuditLogEntryCreate(
+            severity="warning",
+            event_type="key_operation",
+            event_subtype="KEY_DISABLED",
+            actor=actor,
+            description=f"Disabled key {key.key_label}",
+            metadata_json={
+                "master_key_id": str(key.id),
+                "key_label": key.key_label,
+                "previous_status": previous_status,
+            },
+        ),
     )
     await db.commit()
     return await get_key(db, key.id)

@@ -9,6 +9,7 @@ from app.models.user import User
 from app.schemas.hsm import (
     AttestationRunRead,
     HsmOverview,
+    KeyCeremonyCreate,
     KeyCeremonyRead,
     MasterKeyCreate,
     MasterKeyRead,
@@ -21,7 +22,9 @@ from app.schemas.hsm import (
 from app.services.hsm_service import (
     approve_ceremony,
     attestation_run_to_read,
+    ceremony_to_read,
     complete_ceremony,
+    create_ceremony,
     create_key,
     disable_key,
     get_hsm_overview,
@@ -55,55 +58,35 @@ async def approve_key_ceremony(
     current_user: User = Depends(require_admin),
 ) -> KeyCeremonyRead:
     ceremony = await approve_ceremony(db, ceremony_id, current_user.email)
-    return KeyCeremonyRead(
-        id=ceremony.id,
-        ceremony_ref=ceremony.ceremony_ref,
-        master_key_label=ceremony.master_key.key_label,
-        predecessor_label=ceremony.predecessor_label,
-        required_approvals=ceremony.required_approvals,
-        approval_count=ceremony.approval_count,
-        quorum_met=ceremony.quorum_met,
-        status=ceremony.status.value,
-        scheduled_at=ceremony.scheduled_at,
-        completed_at=ceremony.completed_at,
-        approvals=[
-            {"custodian_email": a.custodian_email, "approved_at": a.approved_at}
-            for a in ceremony.approvals
-        ],
-    )
+    return ceremony_to_read(ceremony)
+
+
+@router.post("/ceremonies", response_model=KeyCeremonyRead, status_code=201)
+async def initiate_key_ceremony(
+    payload: KeyCeremonyCreate,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_admin),
+) -> KeyCeremonyRead:
+    ceremony = await create_ceremony(db, payload, current_user.email)
+    return ceremony_to_read(ceremony)
 
 
 @router.post("/ceremonies/{ceremony_id}/complete", response_model=KeyCeremonyRead)
 async def complete_key_ceremony(
     ceremony_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ) -> KeyCeremonyRead:
-    ceremony = await complete_ceremony(db, ceremony_id)
-    return KeyCeremonyRead(
-        id=ceremony.id,
-        ceremony_ref=ceremony.ceremony_ref,
-        master_key_label=ceremony.master_key.key_label,
-        predecessor_label=ceremony.predecessor_label,
-        required_approvals=ceremony.required_approvals,
-        approval_count=ceremony.approval_count,
-        quorum_met=ceremony.quorum_met,
-        status=ceremony.status.value,
-        scheduled_at=ceremony.scheduled_at,
-        completed_at=ceremony.completed_at,
-        approvals=[
-            {"custodian_email": a.custodian_email, "approved_at": a.approved_at}
-            for a in ceremony.approvals
-        ],
-    )
+    ceremony = await complete_ceremony(db, ceremony_id, current_user.email)
+    return ceremony_to_read(ceremony)
 
 
 @router.post("/attestation/run", response_model=AttestationRunRead)
 async def trigger_attestation_run(
     db: AsyncSession = Depends(get_db),
-    _: User = Depends(require_admin),
+    current_user: User = Depends(require_admin),
 ) -> AttestationRunRead:
-    run = await run_attestation(db)
+    run = await run_attestation(db, current_user.email)
     return attestation_run_to_read(run)
 
 
