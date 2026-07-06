@@ -2,7 +2,17 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Enum, ForeignKey, String, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -87,3 +97,54 @@ class ConfigChange(Base, TimestampMixin):
     applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     parameter: Mapped[ConfigParameter] = relationship(back_populates="changes")
+
+
+class ConfigurationStatus(str, enum.Enum):
+    DRAFT = "draft"
+    ACTIVE = "active"
+    ARCHIVED = "archived"
+
+
+class Configuration(Base, TimestampMixin):
+    """A versioned configuration *document*.
+
+    Distinct from ``ConfigParameter`` (which tracks individual engine keys),
+    a ``Configuration`` is a named, versioned snapshot of a whole config
+    payload with a draft -> active -> archived lifecycle. Each row is one
+    immutable version; successor versions get ``version = max + 1`` for the
+    same ``name``. Only one version per name is ACTIVE at a time.
+
+    ``payload`` may contain sensitive values; ``sensitive_keys`` names the
+    top-level keys whose values must be masked on read (never returned raw).
+    """
+
+    __tablename__ = "configurations"
+    __table_args__ = (
+        UniqueConstraint("name", "version", name="uq_configurations_name_version"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    name: Mapped[str] = mapped_column(String(120), nullable=False, index=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[ConfigurationStatus] = mapped_column(
+        Enum(ConfigurationStatus, native_enum=False, validate_strings=True),
+        default=ConfigurationStatus.DRAFT,
+        nullable=False,
+        index=True,
+    )
+    payload: Mapped[dict] = mapped_column(JSON, default=dict, nullable=False)
+    sensitive_keys: Mapped[list] = mapped_column(JSON, default=list, nullable=False)
+    checksum: Mapped[str] = mapped_column(String(64), nullable=False)
+    description: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    created_by: Mapped[str] = mapped_column(String(120), nullable=False)
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
+    )
+
+    @property
+    def is_deleted(self) -> bool:
+        return self.deleted_at is not None

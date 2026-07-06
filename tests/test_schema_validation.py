@@ -39,6 +39,12 @@ from app.schemas.compliance import (
     ScoreTrendSeries,
     ScoreTrendsResponse,
 )
+from app.schemas.config import (
+    ConfigurationCreate,
+    ConfigurationImportRequest,
+    ConfigurationUpdate,
+    ConfigurationValidateResponse,
+)
 from app.schemas.hsm import (
     MasterKeyCreate,
     MasterKeyRotateRequest,
@@ -653,3 +659,51 @@ def test_security_health_coerces_nested_checks_and_providers() -> None:
     )
     assert model.providers[0].name == "nexus-luna-primary"
     assert model.checks[0].passed is True
+
+
+# --------------------------------------------------------------------------- #
+# Config Management: versioned configuration documents
+# --------------------------------------------------------------------------- #
+
+
+def test_configuration_create_valid_with_defaults() -> None:
+    model = ConfigurationCreate(name="engine-runtime", payload={"workers": 8})
+    assert model.sensitive_keys == []
+    assert model.description is None
+
+
+def test_configuration_create_rejects_short_name() -> None:
+    with pytest.raises(ValidationError):
+        ConfigurationCreate(name="a", payload={"workers": 8})
+
+
+def test_configuration_create_rejects_missing_payload() -> None:
+    with pytest.raises(ValidationError):
+        ConfigurationCreate(name="engine-runtime")  # type: ignore[call-arg]
+
+
+def test_configuration_create_rejects_non_dict_payload() -> None:
+    with pytest.raises(ValidationError):
+        ConfigurationCreate(name="engine-runtime", payload=["not", "a", "dict"])
+
+
+def test_configuration_update_sensitive_keys_optional() -> None:
+    model = ConfigurationUpdate(payload={"a": 1})
+    assert model.sensitive_keys is None
+
+
+def test_configuration_validate_response_valid() -> None:
+    model = ConfigurationValidateResponse(valid=False, errors=["payload must be a non-empty object"], checksum=None)
+    assert model.valid is False
+    assert model.checksum is None
+
+
+def test_configuration_import_request_requires_at_least_one_item() -> None:
+    with pytest.raises(ValidationError):
+        ConfigurationImportRequest(items=[])
+
+
+def test_configuration_import_request_valid() -> None:
+    model = ConfigurationImportRequest(items=[{"name": "cfg-a", "payload": {"x": 1}}])
+    assert model.items[0].name == "cfg-a"
+    assert model.items[0].sensitive_keys == []

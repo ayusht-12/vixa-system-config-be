@@ -43,6 +43,7 @@ from app.models.compliance import (  # noqa: E402
 )
 from app.models.config import ConfigChange, ConfigChangeStatus, ConfigParameter  # noqa: E402
 from app.models.config import ConfigTier, ConfigValueType  # noqa: E402
+from app.models.config import Configuration, ConfigurationStatus  # noqa: E402
 from app.models.engine import (  # noqa: E402
     ApiEndpointStat,
     ClusterRole,
@@ -119,6 +120,7 @@ async def _wipe_domain_tables(db: AsyncSession) -> None:
         CryptoAlgorithm,
         AttestationRun,
         SecurityProvider,
+        Configuration,
         ConfigChange,
         ConfigParameter,
         SchemaValidationResult,
@@ -617,6 +619,57 @@ async def seed_config(db: AsyncSession) -> None:
     await db.commit()
 
 
+async def seed_configurations(db: AsyncSession) -> None:
+    """Seed a few versioned configuration documents with a realistic lifecycle
+    (archived history + one active version per name, plus a draft)."""
+    from app.services.config_service import _checksum  # single source of truth
+
+    # (name, version, status, payload, sensitive_keys, description, activated_at, archived_at)
+    rows = [
+        ("engine-runtime", 1, ConfigurationStatus.ARCHIVED,
+         {"worker_pool_size": 8, "max_connections": 500, "request_timeout_s": 30, "log_level": "info"},
+         [], "Initial runtime configuration", days_ago(60), days_ago(30)),
+        ("engine-runtime", 2, ConfigurationStatus.ARCHIVED,
+         {"worker_pool_size": 16, "max_connections": 1000, "request_timeout_s": 30, "log_level": "info"},
+         [], "Tuned worker pool for higher throughput", days_ago(30), days_ago(5)),
+        ("engine-runtime", 3, ConfigurationStatus.ACTIVE,
+         {"worker_pool_size": 16, "max_connections": 2000, "request_timeout_s": 20,
+          "log_level": "warn", "gc_target_ms": 2},
+         [], "Current production runtime configuration", days_ago(5), None),
+        ("rate-limit-policy", 1, ConfigurationStatus.ARCHIVED,
+         {"algorithm": "token_bucket", "rps": 1000, "burst": 200},
+         [], "Initial rate-limit policy", days_ago(40), days_ago(12)),
+        ("rate-limit-policy", 2, ConfigurationStatus.ACTIVE,
+         {"algorithm": "sliding_window", "rps": 2000, "burst": 400},
+         [], "Sliding-window policy with higher ceiling", days_ago(12), None),
+        ("oidc-integration", 1, ConfigurationStatus.DRAFT,
+         {"provider": "keycloak", "client_id": "nexus-engine",
+          "client_secret": "s3cr3t-value-not-real", "scopes": "openid profile nexus:read"},
+         ["client_secret"], "Draft OIDC integration wiring", None, None),
+        ("geo-replication", 1, ConfigurationStatus.ACTIVE,
+         {"mode": "active-passive", "primary_region": "us-east-1",
+          "replica_regions": ["us-west-2", "eu-west-1"], "rpo_seconds": 60},
+         [], "Cross-region replication policy", days_ago(20), None),
+    ]
+    for name, version, status_val, payload, sensitive, description, activated, archived in rows:
+        db.add(
+            Configuration(
+                id=uuid.uuid4(),
+                name=name,
+                version=version,
+                status=status_val,
+                payload=payload,
+                sensitive_keys=sensitive,
+                checksum=_checksum(payload),
+                description=description,
+                created_by="admin@nexus",
+                activated_at=activated,
+                archived_at=archived,
+            )
+        )
+    await db.commit()
+
+
 async def seed_hsm(db: AsyncSession) -> None:
     slots_data = [
         (0, "nexus-primary", SlotPurpose.PRIMARY, 487, 1250, 1247.0, "RNG,WRITE,LOGIN"),
@@ -991,6 +1044,9 @@ async def main() -> None:
 
         print("Seeding config parameters and pending changes...")
         await seed_config(db)
+
+        print("Seeding versioned configuration documents...")
+        await seed_configurations(db)
 
         print("Seeding HSM slots, keys, ceremonies, certificates, algorithms, attestation...")
         await seed_hsm(db)

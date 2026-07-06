@@ -9,7 +9,7 @@ from app.models.compliance import (
     ControlMapping,
     SchemaValidationResult,
 )
-from app.models.config import ConfigChange, ConfigParameter
+from app.models.config import ConfigChange, ConfigParameter, Configuration
 from app.models.engine import ApiEndpointStat, EngineInstance, EtcdNode, SystemMetricSample
 from app.models.hsm import (
     AttestationRun,
@@ -52,6 +52,7 @@ __all__ = [
     "ComplianceScoreSnapshot",
     "ConfigParameter",
     "ConfigChange",
+    "Configuration",
     "AuditLogEntry",
     "HsmSlot",
     "MasterKey",
