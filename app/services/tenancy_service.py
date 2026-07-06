@@ -1,8 +1,8 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi import HTTPException, status
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -14,10 +14,12 @@ from app.models.tenancy import (
     SnapshotStatus,
     Tenant,
     TenantBackupSnapshot,
+    TenantMember,
     TenantProvisioningJob,
     TenantSchemaValidation,
     TenantStatus,
 )
+from app.models.user import User
 from app.schemas.tenancy import (
     BackupSnapshotRead,
     BreachAlertRead,
@@ -26,9 +28,12 @@ from app.schemas.tenancy import (
     ProvisioningStepRead,
     TenancyOverview,
     TenantCreate,
+    TenantMemberCreate,
+    TenantMemberRead,
     TenantRead,
     TenantSchemaValidationRead,
     TenantUpdate,
+    TenantUsageSummary,
 )
 
 _STEP_LABELS = {
@@ -355,3 +360,150 @@ async def delete_tenant(db: AsyncSession, tenant_id: uuid.UUID) -> None:
     tenant = await get_tenant(db, tenant_id)
     await db.delete(tenant)
     await db.commit()
+
+
+def tenant_member_to_read(member: TenantMember) -> TenantMemberRead:
+    return TenantMemberRead(
+        id=member.id,
+        tenant_id=member.tenant_id,
+        user_id=member.user_id,
+        email=member.user.email,
+        display_name=member.user.display_name,
+        role=member.role.value,
+        created_at=member.created_at,
+    )
+
+
+async def list_tenant_members(
+    db: AsyncSession, tenant_id: uuid.UUID
+) -> list[TenantMemberRead]:
+    await get_tenant(db, tenant_id)  # 404 if the tenant does not exist
+    result = await db.execute(
+        select(TenantMember)
+        .options(selectinload(TenantMember.user))
+        .where(TenantMember.tenant_id == tenant_id)
+        .order_by(TenantMember.created_at)
+    )
+    return [tenant_member_to_read(m) for m in result.scalars().all()]
+
+
+async def add_tenant_member(
+    db: AsyncSession, tenant_id: uuid.UUID, payload: TenantMemberCreate
+) -> TenantMemberRead:
+    await get_tenant(db, tenant_id)
+    user = await db.get(User, payload.user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    member = TenantMember(
+        id=uuid.uuid4(),
+        tenant_id=tenant_id,
+        user_id=payload.user_id,
+        role=payload.role,
+    )
+    db.add(member)
+    try:
+        await db.flush()
+    except IntegrityError as exc:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="User is already a member of this tenant",
+        ) from exc
+    await db.commit()
+
+    # Re-select with the user eagerly loaded so the response can include the
+    # member's email / display name without a lazy load on an expired instance.
+    result = await db.execute(
+        select(TenantMember)
+        .options(selectinload(TenantMember.user))
+        .where(TenantMember.id == member.id)
+    )
+    return tenant_member_to_read(result.scalar_one())
+
+
+async def remove_tenant_member(
+    db: AsyncSession, tenant_id: uuid.UUID, user_id: uuid.UUID
+) -> None:
+    result = await db.execute(
+        select(TenantMember).where(
+            TenantMember.tenant_id == tenant_id, TenantMember.user_id == user_id
+        )
+    )
+    member = result.scalar_one_or_none()
+    if member is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Tenant membership not found"
+        )
+    await db.delete(member)
+    await db.commit()
+
+
+async def get_tenant_usage(db: AsyncSession, tenant_id: uuid.UUID) -> TenantUsageSummary:
+    tenant = await get_tenant(db, tenant_id)
+
+    async def _count(query) -> int:
+        return (await db.execute(query)).scalar_one()
+
+    member_count = await _count(
+        select(func.count())
+        .select_from(TenantMember)
+        .where(TenantMember.tenant_id == tenant_id)
+    )
+    provisioning_total = await _count(
+        select(func.count())
+        .select_from(TenantProvisioningJob)
+        .where(TenantProvisioningJob.tenant_id == tenant_id)
+    )
+    provisioning_active = await _count(
+        select(func.count())
+        .select_from(TenantProvisioningJob)
+        .where(
+            TenantProvisioningJob.tenant_id == tenant_id,
+            TenantProvisioningJob.status == ProvisioningJobStatus.RUNNING,
+        )
+    )
+    schema_total = await _count(
+        select(func.count())
+        .select_from(TenantSchemaValidation)
+        .where(TenantSchemaValidation.tenant_id == tenant_id)
+    )
+    snapshot_total = await _count(
+        select(func.count())
+        .select_from(TenantBackupSnapshot)
+        .where(TenantBackupSnapshot.tenant_id == tenant_id)
+    )
+    # "Current" mirrors the tenancy overview's currency rule
+    # (_effective_snapshot_status): a snapshot counts only if it is not pending
+    # and was taken within the staleness window (or has no timestamp yet). A
+    # stored-CURRENT row that has since aged past the window is stale, not
+    # current — so the two endpoints never disagree about backup health.
+    stale_cutoff = datetime.now(timezone.utc) - timedelta(hours=_STALE_SNAPSHOT_AFTER_HOURS)
+    snapshot_current = await _count(
+        select(func.count())
+        .select_from(TenantBackupSnapshot)
+        .where(
+            TenantBackupSnapshot.tenant_id == tenant_id,
+            TenantBackupSnapshot.status != SnapshotStatus.PENDING,
+            or_(
+                TenantBackupSnapshot.taken_at.is_(None),
+                TenantBackupSnapshot.taken_at >= stale_cutoff,
+            ),
+        )
+    )
+
+    return TenantUsageSummary(
+        tenant_id=tenant.id,
+        slug=tenant.slug,
+        display_name=tenant.display_name,
+        status=tenant.status.value,
+        member_count=member_count,
+        events_per_second=tenant.events_per_second,
+        provisioning_jobs_total=provisioning_total,
+        active_provisioning_jobs=provisioning_active,
+        schema_validations_total=schema_total,
+        backup_snapshots_total=snapshot_total,
+        current_backup_snapshots=snapshot_current,
+        isolation_score=tenant.isolation_score,
+        isolation_level=tenant.isolation_level,
+    )

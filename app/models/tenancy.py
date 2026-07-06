@@ -2,7 +2,7 @@ import enum
 import uuid
 from datetime import datetime
 
-from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, BigInteger, Boolean, DateTime, Enum, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -64,6 +64,9 @@ class Tenant(Base, TimestampMixin):
     provisioning_jobs: Mapped[list["TenantProvisioningJob"]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
     )
+    memberships: Mapped[list["TenantMember"]] = relationship(
+        back_populates="tenant", cascade="all, delete-orphan"
+    )
     schema_validations: Mapped[list["TenantSchemaValidation"]] = relationship(
         back_populates="tenant", cascade="all, delete-orphan"
     )
@@ -95,6 +98,36 @@ class Tenant(Base, TimestampMixin):
         if self.network_shared:
             return "partial"
         return "strict"
+
+
+class TenantMemberRole(str, enum.Enum):
+    OWNER = "owner"
+    ADMIN = "admin"
+    ANALYST = "analyst"
+    VIEWER = "viewer"
+
+
+class TenantMember(Base, TimestampMixin):
+    __tablename__ = "tenant_members"
+    __table_args__ = (UniqueConstraint("tenant_id", "user_id", name="uq_tenant_members_tenant_user"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    tenant_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("tenants.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    role: Mapped[TenantMemberRole] = mapped_column(
+        Enum(TenantMemberRole, native_enum=False, validate_strings=True),
+        default=TenantMemberRole.VIEWER,
+        nullable=False,
+    )
+
+    tenant: Mapped["Tenant"] = relationship(back_populates="memberships")
+    user: Mapped["User"] = relationship(back_populates="tenant_memberships")
 
 
 class BreachSeverity(str, enum.Enum):

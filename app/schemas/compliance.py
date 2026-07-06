@@ -70,3 +70,80 @@ class ComplianceOverview(BaseModel):
     control_coverage: list[ControlCoverageRow]
     violations: list[ViolationRead]
     schema_validation: SchemaValidationSummary
+
+
+class ControlRead(BaseModel):
+    id: uuid.UUID
+    framework_id: uuid.UUID
+    framework_code: str
+    control_domain: str
+    control_description: str
+    control_code: str
+    status: str
+
+
+class AssessmentCreate(BaseModel):
+    framework_id: uuid.UUID
+
+
+class AssessmentRead(BaseModel):
+    id: uuid.UUID
+    framework_id: uuid.UUID
+    framework_code: str
+    status: str
+    started_by: str
+    started_at: datetime
+    completed_at: datetime | None
+    score: float | None
+    total_controls: int | None
+    mapped_controls: int | None
+    gap_controls: int | None
+    notes: str | None
+
+
+class FrameworkScore(BaseModel):
+    code: str
+    display_name: str
+    score: float
+    certified: bool
+    open_violation_count: int
+
+
+class ComplianceSummary(BaseModel):
+    overall_score: float
+    framework_count: int
+    certified_count: int
+    total_controls: int
+    mapped_controls: int
+    partial_controls: int
+    gap_controls: int
+    open_violation_count: int
+    frameworks: list[FrameworkScore]
+
+
+class GapRead(BaseModel):
+    framework_id: uuid.UUID
+    framework_code: str
+    control_domain: str
+    control_description: str
+    control_code: str
+    status: str  # gap | partial
+
+
+class ScoreTrendPoint(BaseModel):
+    captured_at: datetime
+    score: float
+
+
+class ScoreTrendSeries(BaseModel):
+    framework_id: uuid.UUID
+    code: str
+    display_name: str
+    current_score: float
+    delta: float
+    points: list[ScoreTrendPoint]
+
+
+class ScoreTrendsResponse(BaseModel):
+    window_days: int
+    series: list[ScoreTrendSeries]

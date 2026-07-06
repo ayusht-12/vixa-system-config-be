@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
-from sqlalchemy import delete  # noqa: E402
+from sqlalchemy import delete, select  # noqa: E402
 from sqlalchemy.ext.asyncio import AsyncSession  # noqa: E402
 
 from app.core.security import hash_password  # noqa: E402
@@ -32,6 +32,7 @@ from app.models.anomaly import (  # noqa: E402
 )
 from app.models.compliance import (  # noqa: E402
     ComplianceFramework,
+    ComplianceScoreSnapshot,
     ComplianceViolation,
     ControlMapping,
     ControlStatus,
@@ -61,6 +62,11 @@ from app.models.hsm import (  # noqa: E402
     KeyCustodianApproval,
     MasterKey,
     MasterKeyStatus,
+    SecurityOperation,
+    SecurityOperationStatus,
+    SecurityOperationType,
+    SecurityProvider,
+    SecurityProviderType,
     SlotPurpose,
 )
 from app.models.tenancy import (  # noqa: E402
@@ -106,14 +112,17 @@ async def _wipe_domain_tables(db: AsyncSession) -> None:
         BreachAlert,
         KeyCustodianApproval,
         KeyCeremony,
+        SecurityOperation,
         MasterKey,
         HsmSlot,
         Certificate,
         CryptoAlgorithm,
         AttestationRun,
+        SecurityProvider,
         ConfigChange,
         ConfigParameter,
         SchemaValidationResult,
+        ComplianceScoreSnapshot,
         ComplianceViolation,
         ControlMapping,
         ComplianceFramework,
@@ -508,6 +517,40 @@ async def seed_compliance(db: AsyncSession) -> None:
     await db.commit()
 
 
+# Fixed per-step wiggle (13 steps) so the seeded history looks organic without
+# needing randomness; each series still lands exactly on the framework's score.
+_SNAPSHOT_WIGGLE = [0.0, -0.4, 0.5, -0.3, 0.2, -0.5, 0.6, -0.2, 0.3, -0.4, 0.5, -0.1, 0.0]
+
+
+async def seed_score_snapshots(db: AsyncSession) -> None:
+    """Record ~30 days of compliance score history per framework, trending up
+    to each framework's current score. Idempotent and non-destructive to other
+    tables: it only clears and repopulates compliance_score_snapshots."""
+    await db.execute(delete(ComplianceScoreSnapshot))
+    frameworks = (await db.execute(select(ComplianceFramework))).scalars().all()
+    now = datetime.now(timezone.utc)
+    steps = len(_SNAPSHOT_WIGGLE)
+    for framework in frameworks:
+        end_score = framework.score
+        start_score = round(end_score - 3.0, 1)
+        for i in range(steps):
+            frac = i / (steps - 1)
+            score = round(
+                min(100.0, max(60.0, start_score + (end_score - start_score) * frac + _SNAPSHOT_WIGGLE[i])),
+                1,
+            )
+            captured = now - timedelta(days=30) + timedelta(days=frac * 30)
+            db.add(
+                ComplianceScoreSnapshot(
+                    id=uuid.uuid4(),
+                    framework_id=framework.id,
+                    score=score,
+                    captured_at=captured,
+                )
+            )
+    await db.commit()
+
+
 async def seed_config(db: AsyncSession) -> None:
     parameters = [
         # Critical
@@ -722,6 +765,101 @@ async def seed_hsm(db: AsyncSession) -> None:
     await db.commit()
 
 
+async def seed_security(db: AsyncSession) -> None:
+    """Seed configured crypto providers and key-operation history.
+
+    Runs after ``seed_hsm`` so operation rows can be linked back to the master
+    keys they reference (by label). Providers hold non-secret hardware metadata
+    only — no key material.
+    """
+    providers = [
+        dict(
+            name="nexus-luna-primary",
+            provider_type=SecurityProviderType.PKCS11,
+            model="Thales Luna 7",
+            manufacturer="Thales Group",
+            library_path="/usr/lib/libCryptoki2_64.so",
+            firmware_version="7.4.2-build.47",
+            serial_number="TL7-US-E1-0042",
+            fips_level="FIPS 140-3 Level 3",
+            is_active=True,
+            pool_active=8,
+            pool_max=10,
+            connection_timeout_seconds=5,
+            avg_latency_ms=0.4,
+            session_count=8,
+            rw_session_count=3,
+            error_count_24h=0,
+            supported_mechanisms=[
+                "CKM_AES_GCM", "CKM_RSA_PKCS", "CKM_ECDSA", "CKM_SHA256_HMAC",
+                "CKM_ECDH1_DERIVE", "CKM_AES_KEY_WRAP", "CKM_RSA_OAEP", "CKM_SHA384",
+            ],
+            last_health_check_at=hours_ago(0.05),
+        ),
+        dict(
+            name="nexus-luna-dr",
+            provider_type=SecurityProviderType.PKCS11,
+            model="Thales Luna 7",
+            manufacturer="Thales Group",
+            library_path="/usr/lib/libCryptoki2_64.so",
+            firmware_version="7.4.2-build.47",
+            serial_number="TL7-US-W2-0043",
+            fips_level="FIPS 140-3 Level 3",
+            is_active=True,
+            pool_active=0,
+            pool_max=4,
+            connection_timeout_seconds=5,
+            avg_latency_ms=0.6,
+            session_count=0,
+            rw_session_count=0,
+            error_count_24h=0,
+            supported_mechanisms=[
+                "CKM_AES_GCM", "CKM_RSA_PKCS", "CKM_ECDSA", "CKM_SHA256_HMAC",
+            ],
+            last_health_check_at=hours_ago(0.1),
+        ),
+    ]
+    for provider in providers:
+        db.add(SecurityProvider(id=uuid.uuid4(), **provider))
+
+    keys = {
+        k.key_label: k
+        for k in (await db.execute(select(MasterKey))).scalars().all()
+    }
+
+    operations = [
+        (SecurityOperationType.KEY_ROTATE, "nexus-master-v5", "engine-core",
+         "Rotated nexus-master-v4 -> nexus-master-v5 via provider abstraction · 1,247 DEKs re-wrapped",
+         hours_ago(0.2)),
+        (SecurityOperationType.CEREMONY_COMPLETE, "nexus-master-v5", "engine-core",
+         "Key ceremony cer-20260703-001 completed · 5-of-5 custodian quorum", hours_ago(0.2)),
+        (SecurityOperationType.KEY_CREATE, "nexus-signing-v5", "admin@nexus",
+         "Registered key reference nexus-signing-v5 (ECDSA-P384) — pending ceremony", days_ago(1)),
+        (SecurityOperationType.ATTESTATION_RUN, None, "scheduler",
+         "Hardware attestation sweep passed · 7/7 checks", hours_ago(6)),
+        (SecurityOperationType.KEY_ROTATE, "tenant-dek-root-v3", "engine-core",
+         "Rotated tenant-dek-root-v2 -> tenant-dek-root-v3 · 24 tenant DEKs re-wrapped", days_ago(104)),
+        (SecurityOperationType.KEY_DISABLE, "aes128-legacy-signing", "security@nexus",
+         "Disabled legacy key aes128-legacy-signing · NIST SP 800-131A Rev.2", days_ago(180)),
+    ]
+    for op_type, label, actor, detail, occurred in operations:
+        referenced = keys.get(label) if label else None
+        db.add(
+            SecurityOperation(
+                id=uuid.uuid4(),
+                operation_type=op_type,
+                master_key_id=referenced.id if referenced else None,
+                key_label=label,
+                actor=actor,
+                status=SecurityOperationStatus.SUCCESS,
+                detail=detail,
+                occurred_at=occurred,
+            )
+        )
+
+    await db.commit()
+
+
 async def seed_tenancy_extras(db: AsyncSession, tenants: dict[str, Tenant]) -> None:
     db.add(
         BreachAlert(
@@ -848,11 +986,17 @@ async def main() -> None:
         print("Seeding compliance frameworks, controls, violations, schema validation...")
         await seed_compliance(db)
 
+        print("Seeding compliance score-trend history...")
+        await seed_score_snapshots(db)
+
         print("Seeding config parameters and pending changes...")
         await seed_config(db)
 
         print("Seeding HSM slots, keys, ceremonies, certificates, algorithms, attestation...")
         await seed_hsm(db)
+
+        print("Seeding security providers and key-operation history...")
+        await seed_security(db)
 
         print("Seeding breach alerts, provisioning, tenant schema validation, snapshots...")
         await seed_tenancy_extras(db, tenants)

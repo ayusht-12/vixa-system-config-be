@@ -12,18 +12,25 @@ from app.schemas.tenancy import (
     ProvisioningJobRead,
     TenancyOverview,
     TenantCreate,
+    TenantMemberCreate,
+    TenantMemberRead,
     TenantRead,
     TenantUpdate,
+    TenantUsageSummary,
 )
 from app.services.tenancy_service import (
+    add_tenant_member,
     advance_provisioning_job,
     create_tenant,
     delete_tenant,
     dismiss_breach_alert,
     get_tenancy_overview,
     get_tenant,
+    get_tenant_usage,
+    list_tenant_members,
     list_tenants,
     provisioning_job_to_read,
+    remove_tenant_member,
     set_tenant_status,
     tenant_to_read,
     update_tenant,
@@ -134,3 +141,44 @@ async def remove_tenant(
 ) -> Message:
     await delete_tenant(db, tenant_id)
     return Message(detail="Tenant deleted successfully")
+
+
+@router.get("/tenants/{tenant_id}/members", response_model=list[TenantMemberRead])
+async def read_tenant_members(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> list[TenantMemberRead]:
+    return await list_tenant_members(db, tenant_id)
+
+
+@router.post(
+    "/tenants/{tenant_id}/members", response_model=TenantMemberRead, status_code=201
+)
+async def add_member(
+    tenant_id: uuid.UUID,
+    payload: TenantMemberCreate,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> TenantMemberRead:
+    return await add_tenant_member(db, tenant_id, payload)
+
+
+@router.delete("/tenants/{tenant_id}/members/{user_id}", response_model=Message)
+async def remove_member(
+    tenant_id: uuid.UUID,
+    user_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> Message:
+    await remove_tenant_member(db, tenant_id, user_id)
+    return Message(detail="Member removed from tenant")
+
+
+@router.get("/tenants/{tenant_id}/usage", response_model=TenantUsageSummary)
+async def read_tenant_usage(
+    tenant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> TenantUsageSummary:
+    return await get_tenant_usage(db, tenant_id)
