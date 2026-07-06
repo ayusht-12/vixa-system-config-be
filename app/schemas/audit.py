@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class AuditLogEntryCreate(BaseModel):
@@ -13,7 +13,7 @@ class AuditLogEntryCreate(BaseModel):
     tenant_id: uuid.UUID | None = None
     tenant_slug: str | None = None
     source_ip: str | None = None
-    metadata_json: dict = {}
+    metadata_json: dict = Field(default_factory=dict)
 
 
 class AuditLogEntryRead(BaseModel):
@@ -32,7 +32,7 @@ class AuditLogEntryRead(BaseModel):
     entry_hash: str
     signing_key_id: str
     signature: str
-    integrity: str  # "valid" — chain position, checked lazily on verify, not per-read
+    integrity: str  # "unverified" until an explicit chain verification is run
 
 
 class ChainVerificationResult(BaseModel):
