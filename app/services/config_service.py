@@ -318,7 +318,7 @@ async def _active_configuration(db: AsyncSession, name: str) -> Configuration | 
 async def _audit_config(
     db: AsyncSession, actor: str, subtype: str, description: str, metadata: dict
 ) -> None:
-    await append_entry(
+    await append_entry_in_transaction(
         db,
         AuditLogEntryCreate(
             severity="info",
