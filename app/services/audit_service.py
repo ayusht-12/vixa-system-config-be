@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import get_signing_key_id, sign_hex_digest, verify_hex_digest
@@ -209,13 +209,12 @@ async def verify_chain(db: AsyncSession) -> ChainVerificationResult:
 async def get_chain_summary(db: AsyncSession) -> HashChainSummary:
     total = (await db.execute(select(func.count()).select_from(AuditLogEntry))).scalar_one()
     tail = await _get_tail(db)
-    verification = await verify_chain(db)
     return HashChainSummary(
         total_entries=total,
         root_hash=tail.entry_hash if tail else None,
         signing_key_id=tail.signing_key_id if tail else None,
-        last_verified_at=datetime.now(timezone.utc),
-        last_verification=verification,
+        last_verified_at=None,
+        last_verification=None,
     )
 
 
@@ -226,25 +225,44 @@ async def list_entries(
     event_type: str | None = None,
     tenant_slug: str | None = None,
     actor_search: str | None = None,
+    search: str | None = None,
+    from_time: datetime | None = None,
+    to_time: datetime | None = None,
     page: int = 1,
     page_size: int = 50,
 ) -> tuple[list[AuditLogEntryRead], int]:
     query = select(AuditLogEntry)
     count_query = select(func.count()).select_from(AuditLogEntry)
+    filters = []
 
     if severity:
-        query = query.where(AuditLogEntry.severity == severity)
-        count_query = count_query.where(AuditLogEntry.severity == severity)
+        filters.append(AuditLogEntry.severity == severity)
     if event_type:
-        query = query.where(AuditLogEntry.event_type == event_type)
-        count_query = count_query.where(AuditLogEntry.event_type == event_type)
+        filters.append(AuditLogEntry.event_type == event_type)
     if tenant_slug:
-        query = query.where(AuditLogEntry.tenant_slug == tenant_slug)
-        count_query = count_query.where(AuditLogEntry.tenant_slug == tenant_slug)
+        filters.append(AuditLogEntry.tenant_slug == tenant_slug)
     if actor_search:
         pattern = f"%{actor_search}%"
-        query = query.where(AuditLogEntry.actor.ilike(pattern))
-        count_query = count_query.where(AuditLogEntry.actor.ilike(pattern))
+        filters.append(AuditLogEntry.actor.ilike(pattern))
+    if search:
+        pattern = f"%{search}%"
+        filters.append(
+            or_(
+                AuditLogEntry.actor.ilike(pattern),
+                AuditLogEntry.description.ilike(pattern),
+                AuditLogEntry.event_subtype.ilike(pattern),
+                AuditLogEntry.tenant_slug.ilike(pattern),
+                AuditLogEntry.source_ip.ilike(pattern),
+            )
+        )
+    if from_time:
+        filters.append(AuditLogEntry.occurred_at >= from_time)
+    if to_time:
+        filters.append(AuditLogEntry.occurred_at <= to_time)
+
+    if filters:
+        query = query.where(*filters)
+        count_query = count_query.where(*filters)
 
     total = (await db.execute(count_query)).scalar_one()
 
@@ -272,7 +290,7 @@ async def list_entries(
             entry_hash=e.entry_hash,
             signing_key_id=e.signing_key_id,
             signature=e.signature,
-            integrity="valid",
+            integrity="unverified",
         )
         for e in entries
     ], total

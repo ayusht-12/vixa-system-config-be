@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class HsmSlotRead(BaseModel):
@@ -50,6 +50,20 @@ class KeyCeremonyRead(BaseModel):
     scheduled_at: datetime | None
     completed_at: datetime | None
     approvals: list[CustodianApprovalRead]
+
+
+class KeyCeremonyCreate(BaseModel):
+    master_key_id: uuid.UUID
+    predecessor_key_id: uuid.UUID | None = None
+    required_approvals: int = Field(default=5, ge=1, le=10)
+    scheduled_at: datetime | None = None
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def scheduled_at_must_be_timezone_aware(cls, value: datetime | None) -> datetime | None:
+        if value is not None and value.tzinfo is None:
+            raise ValueError("scheduled_at must include timezone information")
+        return value
 
 
 class CertificateRead(BaseModel):

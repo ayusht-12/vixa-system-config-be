@@ -6,11 +6,14 @@ from datetime import datetime, timedelta, timezone
 import pytest
 import pytest_asyncio
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import hash_password
 from app.models.hsm import (
     AttestationRun,
+    KeyCeremony,
+    KeyCustodianApproval,
     HsmSlot,
     MasterKey,
     MasterKeyStatus,
@@ -21,6 +24,7 @@ from app.models.hsm import (
     SecurityProviderType,
     SlotPurpose,
 )
+from app.models.audit import AuditLogEntry
 from app.models.user import User
 
 TEST_EMAIL = "test@nexus.local"
@@ -384,6 +388,281 @@ async def test_disable_requires_admin(
         f"/api/v1/hsm/keys/{hsm_env['active_key'].id}/disable", headers=_auth(token)
     )
     assert resp.status_code == 403
+
+
+# --------------------------------------------------------------------------- #
+# Key ceremonies
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_initiate_key_ceremony(
+    client: AsyncClient, test_user: User, hsm_env: dict, db_session: AsyncSession
+) -> None:
+    pending = MasterKey(
+        id=uuid.uuid4(),
+        key_label="nexus-master-v6",
+        slot_id=hsm_env["slot"].id,
+        algorithm="AES-256",
+        status=MasterKeyStatus.PENDING,
+        rotation_policy_days=180,
+    )
+    db_session.add(pending)
+    await db_session.commit()
+
+    token = await _login(client, TEST_EMAIL, TEST_PASSWORD)
+    resp = await client.post(
+        "/api/v1/hsm/ceremonies",
+        headers=_auth(token),
+        json={
+            "master_key_id": str(pending.id),
+            "predecessor_key_id": str(hsm_env["active_key"].id),
+            "required_approvals": 2,
+            "scheduled_at": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["master_key_label"] == "nexus-master-v6"
+    assert body["predecessor_label"] == "nexus-master-v5"
+    assert body["required_approvals"] == 2
+    assert body["status"] == "pending"
+    assert body["approvals"] == []
+
+    audit = (
+        await db_session.execute(
+            select(AuditLogEntry).where(
+                AuditLogEntry.event_subtype == "KEY_CEREMONY_INITIATED"
+            )
+        )
+    ).scalar_one()
+    assert audit.actor == TEST_EMAIL
+    assert audit.metadata_json["master_key_label"] == "nexus-master-v6"
+
+
+@pytest.mark.asyncio
+async def test_initiate_key_ceremony_rejects_duplicate_active_ceremony(
+    client: AsyncClient, test_user: User, hsm_env: dict, db_session: AsyncSession
+) -> None:
+    pending = MasterKey(
+        id=uuid.uuid4(),
+        key_label="nexus-pending-ceremony-v1",
+        slot_id=hsm_env["slot"].id,
+        algorithm="AES-256",
+        status=MasterKeyStatus.PENDING,
+        rotation_policy_days=180,
+    )
+    db_session.add(pending)
+    await db_session.flush()
+    db_session.add(
+        KeyCeremony(
+            id=uuid.uuid4(),
+            ceremony_ref="CER-EXISTING",
+            master_key_id=pending.id,
+            required_approvals=2,
+        )
+    )
+    await db_session.commit()
+
+    token = await _login(client, TEST_EMAIL, TEST_PASSWORD)
+    resp = await client.post(
+        "/api/v1/hsm/ceremonies",
+        headers=_auth(token),
+        json={"master_key_id": str(pending.id), "required_approvals": 2},
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_initiate_key_ceremony_requires_pending_key(
+    client: AsyncClient, test_user: User, hsm_env: dict
+) -> None:
+    token = await _login(client, TEST_EMAIL, TEST_PASSWORD)
+    resp = await client.post(
+        "/api/v1/hsm/ceremonies",
+        headers=_auth(token),
+        json={"master_key_id": str(hsm_env["active_key"].id), "required_approvals": 2},
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_initiate_key_ceremony_rejects_naive_schedule(
+    client: AsyncClient, test_user: User, hsm_env: dict, db_session: AsyncSession
+) -> None:
+    pending = MasterKey(
+        id=uuid.uuid4(),
+        key_label="nexus-naive-schedule-v1",
+        slot_id=hsm_env["slot"].id,
+        algorithm="AES-256",
+        status=MasterKeyStatus.PENDING,
+        rotation_policy_days=180,
+    )
+    db_session.add(pending)
+    await db_session.commit()
+
+    token = await _login(client, TEST_EMAIL, TEST_PASSWORD)
+    resp = await client.post(
+        "/api/v1/hsm/ceremonies",
+        headers=_auth(token),
+        json={
+            "master_key_id": str(pending.id),
+            "required_approvals": 2,
+            "scheduled_at": "2026-07-06T09:00:00",
+        },
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_initiate_key_ceremony_requires_admin(
+    client: AsyncClient, non_admin: User, hsm_env: dict, db_session: AsyncSession
+) -> None:
+    pending = MasterKey(
+        id=uuid.uuid4(),
+        key_label="nexus-viewer-ceremony-v1",
+        slot_id=hsm_env["slot"].id,
+        algorithm="AES-256",
+        status=MasterKeyStatus.PENDING,
+        rotation_policy_days=180,
+    )
+    db_session.add(pending)
+    await db_session.commit()
+
+    token = await _login(client, "viewer@nexus.local", "ViewerPass!123")
+    resp = await client.post(
+        "/api/v1/hsm/ceremonies",
+        headers=_auth(token),
+        json={"master_key_id": str(pending.id), "required_approvals": 2},
+    )
+    assert resp.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_approve_ceremony_is_idempotent(
+    client: AsyncClient, test_user: User, hsm_env: dict, db_session: AsyncSession
+) -> None:
+    pending = MasterKey(
+        id=uuid.uuid4(),
+        key_label="nexus-approve-idempotent-v1",
+        slot_id=hsm_env["slot"].id,
+        algorithm="AES-256",
+        status=MasterKeyStatus.PENDING,
+        rotation_policy_days=180,
+    )
+    db_session.add(pending)
+    await db_session.flush()
+    ceremony = KeyCeremony(
+        id=uuid.uuid4(),
+        ceremony_ref="CER-IDEMPOTENT",
+        master_key_id=pending.id,
+        required_approvals=2,
+    )
+    db_session.add(ceremony)
+    await db_session.commit()
+
+    token = await _login(client, TEST_EMAIL, TEST_PASSWORD)
+    first = await client.post(
+        f"/api/v1/hsm/ceremonies/{ceremony.id}/approve", headers=_auth(token)
+    )
+    second = await client.post(
+        f"/api/v1/hsm/ceremonies/{ceremony.id}/approve", headers=_auth(token)
+    )
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert second.json()["approval_count"] == 1
+    audits = (
+        await db_session.execute(
+            select(AuditLogEntry).where(
+                AuditLogEntry.event_subtype == "KEY_CEREMONY_APPROVED"
+            )
+        )
+    ).scalars().all()
+    assert len(audits) == 1
+
+
+@pytest.mark.asyncio
+async def test_complete_ceremony_requires_quorum(
+    client: AsyncClient, test_user: User, hsm_env: dict, db_session: AsyncSession
+) -> None:
+    pending = MasterKey(
+        id=uuid.uuid4(),
+        key_label="nexus-no-quorum-v1",
+        slot_id=hsm_env["slot"].id,
+        algorithm="AES-256",
+        status=MasterKeyStatus.PENDING,
+        rotation_policy_days=180,
+    )
+    db_session.add(pending)
+    await db_session.flush()
+    ceremony = KeyCeremony(
+        id=uuid.uuid4(),
+        ceremony_ref="CER-NO-QUORUM",
+        master_key_id=pending.id,
+        required_approvals=2,
+    )
+    db_session.add(ceremony)
+    await db_session.commit()
+
+    token = await _login(client, TEST_EMAIL, TEST_PASSWORD)
+    resp = await client.post(
+        f"/api/v1/hsm/ceremonies/{ceremony.id}/complete", headers=_auth(token)
+    )
+    assert resp.status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_complete_ceremony_activates_pending_key_and_audits(
+    client: AsyncClient, test_user: User, hsm_env: dict, db_session: AsyncSession
+) -> None:
+    pending = MasterKey(
+        id=uuid.uuid4(),
+        key_label="nexus-complete-v1",
+        slot_id=hsm_env["slot"].id,
+        algorithm="AES-256",
+        status=MasterKeyStatus.PENDING,
+        rotation_policy_days=180,
+    )
+    db_session.add(pending)
+    await db_session.flush()
+    ceremony = KeyCeremony(
+        id=uuid.uuid4(),
+        ceremony_ref="CER-COMPLETE",
+        master_key_id=pending.id,
+        predecessor_label=hsm_env["active_key"].key_label,
+        required_approvals=1,
+    )
+    db_session.add(ceremony)
+    await db_session.flush()
+    db_session.add(
+        KeyCustodianApproval(
+            ceremony_id=ceremony.id,
+            custodian_email=TEST_EMAIL,
+            approved_at=datetime.now(timezone.utc),
+        )
+    )
+    await db_session.commit()
+
+    token = await _login(client, TEST_EMAIL, TEST_PASSWORD)
+    resp = await client.post(
+        f"/api/v1/hsm/ceremonies/{ceremony.id}/complete", headers=_auth(token)
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "complete"
+
+    pending_detail = await client.get(f"/api/v1/hsm/keys/{pending.id}", headers=_auth(token))
+    old_detail = await client.get(
+        f"/api/v1/hsm/keys/{hsm_env['active_key'].id}", headers=_auth(token)
+    )
+    assert pending_detail.json()["status"] == "active"
+    assert old_detail.json()["status"] == "retired"
+
+    audit = (
+        await db_session.execute(
+            select(AuditLogEntry).where(AuditLogEntry.event_subtype == "KEY_ROTATION_COMPLETE")
+        )
+    ).scalar_one()
+    assert audit.actor == TEST_EMAIL
 
 
 # --------------------------------------------------------------------------- #
