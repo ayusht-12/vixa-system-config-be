@@ -51,3 +51,35 @@ class EventTrends(BaseModel):
 
 
 DashboardActivityPage = Page[AuditLogEntryRead]
+
+
+# --------------------------------------------------------------------------- #
+# Cross-module KPI overviews (dashboard aggregation)
+# --------------------------------------------------------------------------- #
+
+
+class SeverityCount(BaseModel):
+    severity: str
+    count: int
+
+
+class CategoryCount(BaseModel):
+    category: str
+    count: int
+
+
+class AnomalyOverviewKpis(BaseModel):
+    """Compact anomaly KPIs for the command-center dashboard — a light
+    aggregation distinct from the full anomaly-detection overview."""
+
+    open_count: int
+    investigating_count: int
+    resolved_last_24h: int
+    dismissed_last_24h: int
+    critical_open: int
+    high_open: int
+    events_last_24h: int
+    events_last_hour: int
+    ml_model_name: str
+    open_by_severity: list[SeverityCount]
+    top_categories: list[CategoryCount]

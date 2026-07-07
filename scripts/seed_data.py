@@ -52,6 +52,19 @@ from app.models.engine import (  # noqa: E402
     MetricKey,
     SystemMetricSample,
 )
+from app.models.notification import (  # noqa: E402
+    AlertChannel,
+    AlertRule,
+    Notification,
+    NotificationSeverity,
+)
+from app.models.operations import (  # noqa: E402
+    ApplicationError,
+    BackgroundJob,
+    ErrorLevel,
+    JobStatus,
+)
+from app.models.rbac import Permission, Role, RolePermission, UserRole  # noqa: E402
 from app.models.hsm import (  # noqa: E402
     AttestationRun,
     Certificate,
@@ -107,6 +120,15 @@ async def _wipe_domain_tables(db: AsyncSession) -> None:
     key errors on unique columns (slug, key, ceremony_ref, ...).
     """
     for model in [
+        # RBAC / notifications / operations (children before parents)
+        UserRole,
+        RolePermission,
+        Role,
+        Permission,
+        Notification,
+        AlertRule,
+        BackgroundJob,
+        ApplicationError,
         TenantBackupSnapshot,
         TenantSchemaValidation,
         TenantProvisioningJob,
@@ -1148,15 +1170,308 @@ async def seed_audit_log(db: AsyncSession) -> None:
         )
 
 
+async def seed_rbac(db: AsyncSession, admin: User) -> None:
+    """Seed the RBAC catalogue: permissions, roles, a handful of demo users, and
+    their role assignments. Demo (non-admin) users are re-created each run so the
+    admin account and its credentials are never disturbed."""
+    # Remove prior demo users (everything but the primary admin). Their
+    # user_roles rows are already cleared by the wipe step.
+    await db.execute(delete(User).where(User.email != admin.email))
+    await db.flush()
+
+    # (name, resource, action, description)
+    permission_defs = [
+        ("dashboard:read", "dashboard", "read", "View the command-center dashboard"),
+        ("tenants:read", "tenants", "read", "View tenants"),
+        ("tenants:create", "tenants", "create", "Provision tenants"),
+        ("tenants:update", "tenants", "update", "Modify tenants"),
+        ("tenants:delete", "tenants", "delete", "Deactivate or remove tenants"),
+        ("config:read", "config", "read", "View configuration"),
+        ("config:update", "config", "update", "Stage configuration changes"),
+        ("config:apply", "config", "apply", "Apply pending configuration changes"),
+        ("audit:read", "audit", "read", "View the audit log"),
+        ("audit:export", "audit", "export", "Export audit metadata"),
+        ("audit:verify", "audit", "verify", "Verify the audit hash chain"),
+        ("anomalies:read", "anomalies", "read", "View anomaly detections"),
+        ("anomalies:manage", "anomalies", "manage", "Acknowledge / resolve anomalies"),
+        ("compliance:read", "compliance", "read", "View compliance posture"),
+        ("compliance:assess", "compliance", "assess", "Run compliance assessments"),
+        ("security:read", "security", "read", "View HSM / security state"),
+        ("security:rotate_key", "security", "rotate_key", "Rotate cryptographic keys"),
+        ("rbac:read", "rbac", "read", "View users, roles and permissions"),
+        ("rbac:manage", "rbac", "manage", "Manage users, roles and grants"),
+        ("notifications:read", "notifications", "read", "View notifications"),
+        ("alerts:manage", "alerts", "manage", "Manage alert rules"),
+        ("operations:read", "operations", "read", "View operational observability"),
+    ]
+    permissions: dict[str, Permission] = {}
+    for name, resource, action, description in permission_defs:
+        perm = Permission(
+            id=uuid.uuid4(), name=name, resource=resource, action=action, description=description
+        )
+        db.add(perm)
+        permissions[name] = perm
+    await db.flush()
+
+    all_perm_names = [name for name, *_ in permission_defs]
+    read_only_names = [n for n in all_perm_names if n.endswith(":read")]
+
+    # (name, description, is_active, permission_names)
+    role_defs = [
+        ("Platform Admin", "Full administrative access to every module", True, all_perm_names),
+        (
+            "Security Officer",
+            "HSM, key lifecycle, anomaly response and audit verification",
+            True,
+            [
+                "dashboard:read", "security:read", "security:rotate_key", "audit:read",
+                "audit:verify", "anomalies:read", "anomalies:manage", "operations:read",
+            ],
+        ),
+        (
+            "Compliance Auditor",
+            "Compliance posture, assessments and audit export",
+            True,
+            [
+                "dashboard:read", "compliance:read", "compliance:assess", "audit:read",
+                "audit:export", "notifications:read",
+            ],
+        ),
+        (
+            "Tenant Operator",
+            "Tenant provisioning and configuration read access",
+            True,
+            [
+                "dashboard:read", "tenants:read", "tenants:create", "tenants:update",
+                "tenants:delete", "config:read", "notifications:read",
+            ],
+        ),
+        ("Read-Only Analyst", "View-only access across all modules", True, read_only_names),
+        (
+            "Legacy Integrator",
+            "Deprecated service-integration role — retained for history",
+            False,
+            ["dashboard:read", "config:read"],
+        ),
+    ]
+    roles: dict[str, Role] = {}
+    for name, description, is_active, perm_names in role_defs:
+        role = Role(id=uuid.uuid4(), name=name, description=description, is_active=is_active)
+        db.add(role)
+        await db.flush()
+        roles[name] = role
+        for perm_name in perm_names:
+            db.add(RolePermission(role_id=role.id, permission_id=permissions[perm_name].id))
+
+    # Demo users, one per operational role (admin keeps Platform Admin).
+    demo_users = [
+        ("sofia.security@nexus", "Sofia Okafor", True, False, "Security Officer"),
+        ("carl.compliance@nexus", "Carl Devi", True, False, "Compliance Auditor"),
+        ("tara.tenant@nexus", "Tara Nilsson", True, False, "Tenant Operator"),
+        ("ravi.analyst@nexus", "Ravi Menon", True, False, "Read-Only Analyst"),
+        ("leo.legacy@nexus", "Leo Prakash", False, False, "Legacy Integrator"),
+    ]
+    for email, display_name, is_active, is_admin, role_name in demo_users:
+        user = User(
+            id=uuid.uuid4(),
+            email=email,
+            display_name=display_name,
+            hashed_password=hash_password("NexusDemo!2026"),
+            is_active=is_active,
+            is_admin=is_admin,
+        )
+        db.add(user)
+        await db.flush()
+        db.add(UserRole(user_id=user.id, role_id=roles[role_name].id, assigned_by=admin.email))
+
+    # The primary admin is a Platform Admin.
+    db.add(UserRole(user_id=admin.id, role_id=roles["Platform Admin"].id, assigned_by=admin.email))
+
+    await db.commit()
+
+
+async def seed_notifications(db: AsyncSession, admin: User) -> None:
+    """Seed notifications for the admin inbox plus admin-configured alert rules."""
+    # (severity, category, title, body, source, link, is_read, age_hours)
+    notifications = [
+        (NotificationSeverity.CRITICAL, "anomaly", "Privilege escalation detected",
+         "svc-deploy-01 assumed IAM::AdminRole without MFA on tenant acme-corp.",
+         "anomaly", "/anomalies", False, 0.02),
+        (NotificationSeverity.CRITICAL, "security", "Signing key expiring in 14 days",
+         "nexus-signing-v4 (ECDSA-P384) rotation ceremony cer-20260717-001 is pending quorum.",
+         "security", "/hsm-security", False, 1.5),
+        (NotificationSeverity.WARNING, "compliance", "GDPR encryption control drifted to partial",
+         "healthsys-io PHI store · AES-256 key rotation overdue by 47 days.",
+         "compliance", "/compliance", False, 3.0),
+        (NotificationSeverity.WARNING, "tenancy", "Cross-tenant read attempt blocked",
+         "media-stream-x attempted to read events.acme_corp.raw — blocked by RLS.",
+         "tenancy", "/tenancy", False, 0.2),
+        (NotificationSeverity.WARNING, "operations", "etcd write latency elevated",
+         "etcd-1 write p99 exceeded 15ms threshold — node degraded.",
+         "operations", "/command-center", True, 6.0),
+        (NotificationSeverity.INFO, "security", "Key ceremony completed",
+         "cer-20260703-001 reached 5-of-5 custodian quorum; nexus-master-v5 is active.",
+         "security", "/hsm-security", True, 0.2),
+        (NotificationSeverity.INFO, "config", "Configuration change staged",
+         "audit.retention 5y → 7y staged by admin@nexus, awaiting apply.",
+         "config", "/config-manager", False, 4.0),
+        (NotificationSeverity.INFO, "compliance", "SOC2 assessment passed",
+         "Deloitte Type II assessment recorded a score of 92.8.",
+         "compliance", "/compliance", True, 26.0),
+    ]
+    for severity, category, title, body, source, link, is_read, age_hours in notifications:
+        db.add(
+            Notification(
+                id=uuid.uuid4(),
+                user_id=admin.id,
+                severity=severity,
+                category=category,
+                title=title,
+                body=body,
+                source=source,
+                link=link,
+                is_read=is_read,
+                read_at=hours_ago(age_hours) if is_read else None,
+                created_at=hours_ago(age_hours),
+            )
+        )
+
+    # (name, description, source, condition, threshold, channel, target, enabled, trigger_count, last_triggered_h)
+    alert_rules = [
+        ("Critical anomaly → security channel",
+         "Page the security team when a critical anomaly is raised",
+         "anomaly", "anomaly.severity == critical", NotificationSeverity.CRITICAL,
+         AlertChannel.SLACK, "#sec-oncall", True, 12, 0.02),
+        ("Certificate / key expiry warning",
+         "Notify when a key or certificate is within 30 days of expiry",
+         "security", "days_until_expiry <= 30", NotificationSeverity.WARNING,
+         AlertChannel.EMAIL, "security@nexus", True, 3, 1.5),
+        ("Compliance drift",
+         "Raise when any framework control drifts from mapped",
+         "compliance", "control.status != mapped", NotificationSeverity.WARNING,
+         AlertChannel.IN_APP, "compliance-team", True, 5, 3.0),
+        ("Tenant isolation breach",
+         "Immediate alert on any cross-tenant access attempt",
+         "tenancy", "breach.severity >= warning", NotificationSeverity.WARNING,
+         AlertChannel.WEBHOOK, "https://hooks.nexus.internal/isolation", True, 8, 0.2),
+        ("Audit chain verification failure",
+         "Escalate if the audit hash chain fails verification",
+         "audit", "integrity.is_valid == false", NotificationSeverity.CRITICAL,
+         AlertChannel.EMAIL, "audit-oncall@nexus", False, 0, None),
+    ]
+    for (
+        name, description, source, condition, threshold, channel, target, enabled, count, last_h
+    ) in alert_rules:
+        db.add(
+            AlertRule(
+                id=uuid.uuid4(),
+                name=name,
+                description=description,
+                source=source,
+                condition=condition,
+                threshold_severity=threshold,
+                channel=channel,
+                target=target,
+                is_enabled=enabled,
+                created_by=admin.email,
+                last_triggered_at=hours_ago(last_h) if last_h is not None else None,
+                trigger_count=count,
+            )
+        )
+
+    await db.commit()
+
+
+async def seed_operations(db: AsyncSession) -> None:
+    """Seed background-job runs and recent application errors for observability."""
+    # (name, queue, status, progress, sched_h, start_h, finish_h, dur_ms, attempts, max_attempts, err, detail)
+    jobs = [
+        ("etcd-snapshot", "backups", JobStatus.SUCCEEDED, 100.0, 6.0, 6.0, 5.9, 5421.0, 1, 3,
+         None, "Full etcd snapshot uploaded to s3://nexus-backups-us-east-1"),
+        ("compliance-score-snapshot", "scheduler", JobStatus.SUCCEEDED, 100.0, 24.0, 24.0, 23.99,
+         842.0, 1, 1, None, "Captured score snapshots for 4 frameworks"),
+        ("hsm-attestation-sweep", "security", JobStatus.SUCCEEDED, 100.0, 6.0, 6.0, 5.98, 1203.0,
+         1, 1, None, "7/7 attestation checks passed"),
+        ("tenant-schema-migration", "provisioning", JobStatus.RUNNING, 47.0, 0.3, 0.25, None, None,
+         1, 3, None, "fintech-labs-2 · schema_migration step in progress"),
+        ("audit-chain-verify", "scheduler", JobStatus.QUEUED, 0.0, -0.05, None, None, None, 0, 1,
+         None, "Scheduled full chain verification"),
+        ("dek-rewrap", "security", JobStatus.FAILED, 62.0, 12.0, 12.0, 11.8, 9800.0, 2, 3,
+         "provider timeout after 9.8s on slot 2", "Retry scheduled with backoff"),
+    ]
+    for (
+        name, queue, status_val, progress, sched_h, start_h, finish_h, dur, attempts, max_att,
+        err, detail,
+    ) in jobs:
+        db.add(
+            BackgroundJob(
+                id=uuid.uuid4(),
+                name=name,
+                queue=queue,
+                status=status_val,
+                progress_percent=progress,
+                scheduled_at=hours_ago(sched_h) if sched_h is not None else None,
+                started_at=hours_ago(start_h) if start_h is not None else None,
+                finished_at=hours_ago(finish_h) if finish_h is not None else None,
+                duration_ms=dur,
+                attempts=attempts,
+                max_attempts=max_att,
+                last_error=err,
+                detail=detail,
+            )
+        )
+
+    # (level, error_type, message, source, request_path, status_code, occurrences, resolved, age_h)
+    errors = [
+        (ErrorLevel.ERROR, "ProviderTimeoutError",
+         "HSM provider slot 2 did not respond within 10s during DEK re-wrap",
+         "app.services.hsm_service", "/api/v1/hsm/keys/{id}/rotate", 504, 2, False, 11.8),
+        (ErrorLevel.WARNING, "SlowQueryWarning",
+         "audit-log chain verification exceeded 500ms on a 12k-entry chain",
+         "app.services.audit_service", "/api/v1/audit-log/verify", None, 5, False, 6.0),
+        (ErrorLevel.ERROR, "SchemaValidationError",
+         "EventPayload v2.4 rejected: required property 'tenantId' missing",
+         "app.api.v1.endpoints.tenancy", "/api/v4/events", 422, 47, False, 0.1),
+        (ErrorLevel.CRITICAL, "IsolationBreachError",
+         "cross-tenant read attempt blocked by row-level security",
+         "app.services.tenancy_service", None, 403, 1, False, 0.2),
+        (ErrorLevel.WARNING, "RateLimitExceeded",
+         "global token bucket throttled 12 requests on /api/v4/events",
+         "app.core.ratelimit", "/api/v4/events", 429, 12, True, 2.0),
+    ]
+    for (
+        level, error_type, message, source, request_path, status_code, occurrences, resolved, age_h
+    ) in errors:
+        db.add(
+            ApplicationError(
+                id=uuid.uuid4(),
+                occurred_at=hours_ago(age_h),
+                level=level,
+                error_type=error_type,
+                message=message,
+                source=source,
+                request_path=request_path,
+                status_code=status_code,
+                occurrences=occurrences,
+                resolved=resolved,
+                created_at=hours_ago(age_h),
+            )
+        )
+
+    await db.commit()
+
+
 async def main() -> None:
     async with AsyncSessionLocal() as db:
         print("Wiping existing domain data...")
         await _wipe_domain_tables(db)
 
         print("Seeding user...")
-        result = await db.execute(User.__table__.select().where(User.__table__.c.email == "admin@nexus"))
-        if result.first() is None:
-            await seed_user(db)
+        admin = (
+            await db.execute(select(User).where(User.email == "admin@nexus"))
+        ).scalar_one_or_none()
+        if admin is None:
+            admin = await seed_user(db)
 
         print("Seeding engine instance, etcd cluster, metrics...")
         await seed_engine(db)
@@ -1187,6 +1502,15 @@ async def main() -> None:
 
         print("Seeding breach alerts, provisioning, tenant schema validation, snapshots...")
         await seed_tenancy_extras(db, tenants)
+
+        print("Seeding RBAC permissions, roles, demo users, assignments...")
+        await seed_rbac(db, admin)
+
+        print("Seeding notifications and alert rules...")
+        await seed_notifications(db, admin)
+
+        print("Seeding background jobs and application errors...")
+        await seed_operations(db)
 
         print("Appending audit log entries (hash chain)...")
         await seed_audit_log(db)

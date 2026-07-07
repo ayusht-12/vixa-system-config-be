@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from app.schemas.common import ORMModel
 
@@ -121,3 +121,58 @@ class AnomalyDetectionOverview(BaseModel):
     heatmap: list[HeatmapCell]
     threat_categories: list[ThreatCategoryStat]
     incidents: list[IncidentRead]
+
+
+# --------------------------------------------------------------------------- #
+# History, bulk operations, trends & types
+# --------------------------------------------------------------------------- #
+
+
+class AnomalyHistoryEntry(BaseModel):
+    """One lifecycle event for an anomaly, reconstructed from the immutable
+    audit log (creation and each status transition)."""
+
+    sequence: int
+    occurred_at: datetime
+    actor: str
+    subtype: str
+    description: str
+    previous_status: str | None
+    new_status: str | None
+
+
+class BulkStatusRequest(BaseModel):
+    event_ids: list[uuid.UUID] = Field(min_length=1, max_length=500)
+
+
+class BulkStatusResponse(BaseModel):
+    new_status: str
+    requested: int
+    updated: int
+    updated_ids: list[uuid.UUID]
+    not_found_ids: list[uuid.UUID]
+
+
+class AnomalyTrendBucket(BaseModel):
+    bucket: datetime
+    severity: str
+    count: int
+
+
+class AnomalyTrends(BaseModel):
+    interval: str
+    from_timestamp: datetime
+    to_timestamp: datetime
+    buckets: list[AnomalyTrendBucket]
+
+
+class AnomalyTypeStat(BaseModel):
+    category: str
+    total: int
+    open_count: int
+
+
+class AnomalyTypesResponse(BaseModel):
+    categories: list[AnomalyTypeStat]
+    severities: list[str]
+    statuses: list[str]

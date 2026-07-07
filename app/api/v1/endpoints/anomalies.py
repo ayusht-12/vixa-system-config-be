@@ -1,4 +1,5 @@
 import uuid
+from datetime import datetime, timedelta, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,12 +12,21 @@ from app.schemas.anomaly import (
     AnomalyDetectionOverview,
     AnomalyEventCreate,
     AnomalyEventRead,
+    AnomalyHistoryEntry,
+    AnomalyTrends,
+    AnomalyTypesResponse,
+    BulkStatusRequest,
+    BulkStatusResponse,
 )
 from app.schemas.common import Page
 from app.services.anomaly_service import (
+    bulk_update_anomaly_status,
     create_anomaly_event,
     get_anomaly_detection_overview,
     get_anomaly_event,
+    get_anomaly_history,
+    get_anomaly_trends,
+    get_anomaly_types,
     list_anomaly_events,
     update_anomaly_status,
 )
@@ -30,6 +40,31 @@ async def read_anomaly_overview(
     _: User = Depends(get_current_user),
 ) -> AnomalyDetectionOverview:
     return await get_anomaly_detection_overview(db)
+
+
+@router.get("/trends", response_model=AnomalyTrends)
+async def read_anomaly_trends(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+    from_timestamp: datetime | None = None,
+    to_timestamp: datetime | None = None,
+    interval: str = Query(default="day", pattern="^(hour|day)$"),
+) -> AnomalyTrends:
+    if to_timestamp is None:
+        to_timestamp = datetime.now(timezone.utc)
+    if from_timestamp is None:
+        from_timestamp = to_timestamp - timedelta(days=7)
+    return await get_anomaly_trends(
+        db, from_timestamp=from_timestamp, to_timestamp=to_timestamp, interval=interval
+    )
+
+
+@router.get("/types", response_model=AnomalyTypesResponse)
+async def read_anomaly_types(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> AnomalyTypesResponse:
+    return await get_anomaly_types(db)
 
 
 @router.get("/events", response_model=Page[AnomalyEventRead])
@@ -55,6 +90,28 @@ async def read_anomaly_events(
     return Page(items=items, total=total, page=page, page_size=page_size)
 
 
+@router.post("/bulk-acknowledge", response_model=BulkStatusResponse)
+async def bulk_acknowledge_anomaly_events(
+    payload: BulkStatusRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> BulkStatusResponse:
+    return await bulk_update_anomaly_status(
+        db, payload.event_ids, AnomalyStatus.INVESTIGATING, audit_actor=current_user.email
+    )
+
+
+@router.post("/bulk-resolve", response_model=BulkStatusResponse)
+async def bulk_resolve_anomaly_events(
+    payload: BulkStatusRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+) -> BulkStatusResponse:
+    return await bulk_update_anomaly_status(
+        db, payload.event_ids, AnomalyStatus.RESOLVED, audit_actor=current_user.email
+    )
+
+
 @router.get("/events/{event_id}", response_model=AnomalyEventRead)
 async def read_anomaly_event(
     event_id: uuid.UUID,
@@ -63,6 +120,15 @@ async def read_anomaly_event(
 ) -> AnomalyEventRead:
     event = await get_anomaly_event(db, event_id)
     return AnomalyEventRead.model_validate(event)
+
+
+@router.get("/events/{event_id}/history", response_model=list[AnomalyHistoryEntry])
+async def read_anomaly_event_history(
+    event_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> list[AnomalyHistoryEntry]:
+    return await get_anomaly_history(db, event_id)
 
 
 @router.post("/events", response_model=AnomalyEventRead, status_code=status.HTTP_201_CREATED)

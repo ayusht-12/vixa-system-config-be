@@ -5,17 +5,24 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
+from fastapi import HTTPException, status
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import get_signing_key_id, sign_hex_digest, verify_hex_digest
 from app.models.audit import AuditLogEntry
 from app.schemas.audit import (
+    AuditExportResponse,
     AuditLogEntryCreate,
     AuditLogEntryRead,
     ChainVerificationResult,
     HashChainSummary,
+    IntegrityStatus,
 )
+
+# Hard cap on a single export so an unbounded table scan can never be triggered
+# by one request; callers narrow the window with filters for larger ranges.
+_EXPORT_MAX_ROWS = 10_000
 
 REDACTED_METADATA_VALUE = "[REDACTED]"
 SENSITIVE_METADATA_KEYS = {
@@ -215,6 +222,94 @@ async def get_chain_summary(db: AsyncSession) -> HashChainSummary:
         signing_key_id=tail.signing_key_id if tail else None,
         last_verified_at=None,
         last_verification=None,
+    )
+
+
+def _entry_to_read(entry: AuditLogEntry, *, integrity: str = "unverified") -> AuditLogEntryRead:
+    return AuditLogEntryRead(
+        id=entry.id,
+        sequence=entry.sequence,
+        occurred_at=entry.occurred_at,
+        severity=entry.severity.value,
+        event_type=entry.event_type.value,
+        event_subtype=entry.event_subtype,
+        tenant_slug=entry.tenant_slug,
+        actor=entry.actor,
+        source_ip=entry.source_ip,
+        description=entry.description,
+        metadata_json=entry.metadata_json,
+        prev_hash=entry.prev_hash,
+        entry_hash=entry.entry_hash,
+        signing_key_id=entry.signing_key_id,
+        signature=entry.signature,
+        integrity=integrity,
+    )
+
+
+async def get_entry(db: AsyncSession, audit_log_id: uuid.UUID) -> AuditLogEntryRead:
+    entry = await db.get(AuditLogEntry, audit_log_id)
+    if entry is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Audit entry not found"
+        )
+    return _entry_to_read(entry)
+
+
+async def export_entries(
+    db: AsyncSession,
+    *,
+    severity: str | None = None,
+    event_type: str | None = None,
+    tenant_slug: str | None = None,
+    from_time: datetime | None = None,
+    to_time: datetime | None = None,
+) -> AuditExportResponse:
+    """Chronological export of audit metadata (oldest first), capped at
+    ``_EXPORT_MAX_ROWS`` so a single call can never scan the whole table."""
+    filters = []
+    if severity:
+        filters.append(AuditLogEntry.severity == severity)
+    if event_type:
+        filters.append(AuditLogEntry.event_type == event_type)
+    if tenant_slug:
+        filters.append(AuditLogEntry.tenant_slug == tenant_slug)
+    if from_time:
+        filters.append(AuditLogEntry.occurred_at >= from_time)
+    if to_time:
+        filters.append(AuditLogEntry.occurred_at <= to_time)
+
+    count_query = select(func.count()).select_from(AuditLogEntry)
+    query = select(AuditLogEntry).order_by(AuditLogEntry.sequence.asc()).limit(_EXPORT_MAX_ROWS)
+    if filters:
+        count_query = count_query.where(*filters)
+        query = query.where(*filters)
+
+    total = (await db.execute(count_query)).scalar_one()
+    entries = (await db.execute(query)).scalars().all()
+    return AuditExportResponse(
+        generated_at=datetime.now(timezone.utc),
+        total=total,
+        returned=len(entries),
+        truncated=total > len(entries),
+        entries=[_entry_to_read(e) for e in entries],
+    )
+
+
+async def get_integrity_status(db: AsyncSession) -> IntegrityStatus:
+    """Live tamper-evidence status: verifies the chain and reports whether it
+    is currently intact, plus where the first break is (if any)."""
+    verification = await verify_chain(db)
+    tail = await _get_tail(db)
+    return IntegrityStatus(
+        total_entries=verification.verified_count + verification.failed_count,
+        is_valid=verification.is_valid,
+        verified_count=verification.verified_count,
+        failed_count=verification.failed_count,
+        first_break_sequence=verification.first_break_sequence,
+        root_hash=verification.root_hash,
+        signing_key_id=tail.signing_key_id if tail else None,
+        checked_at=datetime.now(timezone.utc),
+        duration_ms=verification.duration_ms,
     )
 
 

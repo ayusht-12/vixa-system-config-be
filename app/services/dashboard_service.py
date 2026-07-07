@@ -4,21 +4,33 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.anomaly import AnomalyEvent, AnomalyStatus
+from app.models.anomaly import AnomalyEvent, AnomalySeverity, AnomalyStatus
 from app.models.audit import AuditLogEntry, AuditSeverity
 from app.models.config import ConfigParameter
 from app.models.tenancy import Tenant, TenantStatus
 from app.schemas.audit import AuditLogEntryRead
+from app.schemas.compliance import ComplianceSummary
 from app.schemas.dashboard import (
+    AnomalyOverviewKpis,
+    CategoryCount,
     DashboardSummary,
     EventTrendBucket,
     EventTrends,
+    SeverityCount,
     TenantHealth,
     TenantHealthList,
     TrendInterval,
 )
+from app.schemas.hsm import SecuritySummary
+from app.services.compliance_service import get_compliance_summary
+from app.services.hsm_service import get_security_summary
 
 _OPEN_ANOMALY_STATUSES = (AnomalyStatus.OPEN, AnomalyStatus.INVESTIGATING)
+
+# Kept in sync with the HSM router's module serial; only echoed in the summary.
+_HSM_MODULE_SERIAL = "TL7-US-E1-0042"
+# Kept in sync with the anomaly service's scoring model label.
+_ML_MODEL_NAME = "IsolationForest v3.2"
 
 
 async def get_summary(db: AsyncSession) -> DashboardSummary:
@@ -159,6 +171,105 @@ async def get_event_trends(
             for row in rows
         ],
     )
+
+
+async def get_anomaly_overview(db: AsyncSession) -> AnomalyOverviewKpis:
+    """Light anomaly KPI aggregation for the dashboard's anomaly card."""
+    now = datetime.now(timezone.utc)
+    since_24h = now - timedelta(hours=24)
+    since_1h = now - timedelta(hours=1)
+
+    status_counts = dict(
+        (
+            await db.execute(
+                select(AnomalyEvent.status, func.count()).group_by(AnomalyEvent.status)
+            )
+        ).all()
+    )
+    open_by_severity = dict(
+        (
+            await db.execute(
+                select(AnomalyEvent.severity, func.count())
+                .where(AnomalyEvent.status.in_(_OPEN_ANOMALY_STATUSES))
+                .group_by(AnomalyEvent.severity)
+            )
+        ).all()
+    )
+
+    resolved_last_24h = (
+        await db.execute(
+            select(func.count())
+            .select_from(AnomalyEvent)
+            .where(
+                AnomalyEvent.status == AnomalyStatus.RESOLVED,
+                AnomalyEvent.resolved_at.is_not(None),
+                AnomalyEvent.resolved_at >= since_24h,
+            )
+        )
+    ).scalar_one()
+    dismissed_last_24h = (
+        await db.execute(
+            select(func.count())
+            .select_from(AnomalyEvent)
+            .where(
+                AnomalyEvent.status == AnomalyStatus.DISMISSED,
+                AnomalyEvent.updated_at >= since_24h,
+            )
+        )
+    ).scalar_one()
+    events_last_24h = (
+        await db.execute(
+            select(func.count())
+            .select_from(AnomalyEvent)
+            .where(AnomalyEvent.occurred_at >= since_24h)
+        )
+    ).scalar_one()
+    events_last_hour = (
+        await db.execute(
+            select(func.count())
+            .select_from(AnomalyEvent)
+            .where(AnomalyEvent.occurred_at >= since_1h)
+        )
+    ).scalar_one()
+
+    category_rows = (
+        await db.execute(
+            select(AnomalyEvent.category, func.count().label("count"))
+            .where(AnomalyEvent.occurred_at >= since_24h)
+            .group_by(AnomalyEvent.category)
+            .order_by(func.count().desc())
+            .limit(5)
+        )
+    ).all()
+
+    return AnomalyOverviewKpis(
+        open_count=status_counts.get(AnomalyStatus.OPEN, 0),
+        investigating_count=status_counts.get(AnomalyStatus.INVESTIGATING, 0),
+        resolved_last_24h=resolved_last_24h,
+        dismissed_last_24h=dismissed_last_24h,
+        critical_open=open_by_severity.get(AnomalySeverity.CRITICAL, 0),
+        high_open=open_by_severity.get(AnomalySeverity.HIGH, 0),
+        events_last_24h=events_last_24h,
+        events_last_hour=events_last_hour,
+        ml_model_name=_ML_MODEL_NAME,
+        open_by_severity=[
+            SeverityCount(severity=sev.value, count=open_by_severity.get(sev, 0))
+            for sev in AnomalySeverity
+        ],
+        top_categories=[
+            CategoryCount(category=row.category, count=row.count) for row in category_rows
+        ],
+    )
+
+
+async def get_compliance_overview(db: AsyncSession) -> ComplianceSummary:
+    """Compliance KPI aggregation — reuses the compliance module's posture summary."""
+    return await get_compliance_summary(db)
+
+
+async def get_security_overview(db: AsyncSession) -> SecuritySummary:
+    """Security/HSM KPI aggregation — reuses the security module's posture summary."""
+    return await get_security_summary(db, module_serial=_HSM_MODULE_SERIAL)
 
 
 async def get_activity(

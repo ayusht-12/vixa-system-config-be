@@ -1,3 +1,4 @@
+import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -8,13 +9,23 @@ from app.core.config import settings
 from app.models.audit import AuditEventType, AuditSeverity
 from app.models.user import User
 from app.schemas.audit import (
+    AuditExportResponse,
     AuditLogEntryCreate,
     AuditLogEntryRead,
     ChainVerificationResult,
     HashChainSummary,
+    IntegrityStatus,
 )
 from app.schemas.common import Page
-from app.services.audit_service import append_entry, get_chain_summary, list_entries, verify_chain
+from app.services.audit_service import (
+    append_entry,
+    export_entries,
+    get_chain_summary,
+    get_entry,
+    get_integrity_status,
+    list_entries,
+    verify_chain,
+)
 
 router = APIRouter()
 
@@ -112,6 +123,53 @@ async def read_chain_summary(
     _: User = Depends(get_current_user),
 ) -> HashChainSummary:
     return await get_chain_summary(db)
+
+
+@router.get("/export", response_model=AuditExportResponse)
+async def export_audit_entries(
+    severity: AuditSeverity | None = None,
+    event_type: AuditEventType | None = None,
+    tenant_slug: str | None = None,
+    from_time: datetime | None = Query(default=None),
+    to_time: datetime | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(require_admin),
+) -> AuditExportResponse:
+    """Admin-only chronological export of audit metadata. Metadata is
+    sanitized at write time, so no sensitive values are ever exported."""
+    from_time = _ensure_timezone_aware(from_time, "from_time")
+    to_time = _ensure_timezone_aware(to_time, "to_time")
+    if from_time is not None and to_time is not None and from_time > to_time:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="from_time must be before or equal to to_time",
+        )
+    return await export_entries(
+        db,
+        severity=severity.value if severity else None,
+        event_type=event_type.value if event_type else None,
+        tenant_slug=tenant_slug,
+        from_time=from_time,
+        to_time=to_time,
+    )
+
+
+@router.get("/integrity-status", response_model=IntegrityStatus)
+async def read_integrity_status(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> IntegrityStatus:
+    """Current tamper-evidence status of the chain (verifies on read)."""
+    return await get_integrity_status(db)
+
+
+@router.get("/entries/{audit_log_id}", response_model=AuditLogEntryRead)
+async def read_audit_entry(
+    audit_log_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> AuditLogEntryRead:
+    return await get_entry(db, audit_log_id)
 
 
 @router.post("/verify", response_model=ChainVerificationResult)

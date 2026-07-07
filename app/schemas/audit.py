@@ -50,3 +50,26 @@ class HashChainSummary(BaseModel):
     signing_key_id: str | None
     last_verified_at: datetime | None
     last_verification: ChainVerificationResult | None
+
+
+class AuditExportResponse(BaseModel):
+    """Controlled export of audit metadata. Entry metadata is already
+    sanitized at write time, so no sensitive values are ever exported."""
+
+    generated_at: datetime
+    total: int
+    returned: int
+    truncated: bool
+    entries: list[AuditLogEntryRead]
+
+
+class IntegrityStatus(BaseModel):
+    total_entries: int
+    is_valid: bool
+    verified_count: int
+    failed_count: int
+    first_break_sequence: int | None
+    root_hash: str | None
+    signing_key_id: str | None
+    checked_at: datetime
+    duration_ms: float

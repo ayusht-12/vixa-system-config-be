@@ -13,11 +13,18 @@ from app.models.anomaly import (
     Incident,
     IncidentStatus,
 )
+from app.models.audit import AuditEventType, AuditLogEntry
 from app.schemas.anomaly import (
     AnomalyDetectionOverview,
     AnomalyEventCreate,
     AnomalyEventRead,
+    AnomalyHistoryEntry,
+    AnomalyTrendBucket,
+    AnomalyTrends,
+    AnomalyTypeStat,
+    AnomalyTypesResponse,
     BehavioralBaselineRead,
+    BulkStatusResponse,
     HeatmapCell,
     IncidentRead,
     SeveritySummaryBucket,
@@ -360,3 +367,152 @@ async def list_anomaly_events(
     )
     events = (await db.execute(query)).scalars().all()
     return [AnomalyEventRead.model_validate(e) for e in events], total
+
+
+# --------------------------------------------------------------------------- #
+# History, bulk operations, trends & types
+# --------------------------------------------------------------------------- #
+
+
+async def get_anomaly_history(
+    db: AsyncSession, event_id: uuid.UUID
+) -> list[AnomalyHistoryEntry]:
+    """Reconstruct an anomaly's lifecycle from the immutable audit chain.
+
+    Each create/status-transition writes an ``ANOMALY_DETECTED`` audit entry
+    tagged with the anomaly id in its metadata, so the history is derived from
+    that append-only log rather than a mutable status column."""
+    await get_anomaly_event(db, event_id)  # 404 if the anomaly is unknown
+    rows = (
+        await db.execute(
+            select(AuditLogEntry)
+            .where(
+                AuditLogEntry.event_type == AuditEventType.ANOMALY_DETECTED,
+                # ``->>`` extracts the JSON field as text (works for both JSON
+                # and JSONB in Postgres; ``.astext`` is JSONB-only).
+                AuditLogEntry.metadata_json.op("->>")("anomaly_id") == str(event_id),
+            )
+            .order_by(AuditLogEntry.sequence.asc())
+        )
+    ).scalars().all()
+    return [
+        AnomalyHistoryEntry(
+            sequence=row.sequence,
+            occurred_at=row.occurred_at,
+            actor=row.actor,
+            subtype=row.event_subtype,
+            description=row.description,
+            previous_status=(row.metadata_json or {}).get("previous_status"),
+            new_status=(row.metadata_json or {}).get("status"),
+        )
+        for row in rows
+    ]
+
+
+async def bulk_update_anomaly_status(
+    db: AsyncSession,
+    event_ids: list[uuid.UUID],
+    status_value: AnomalyStatus,
+    *,
+    audit_actor: str | None = None,
+) -> BulkStatusResponse:
+    """Transition many anomalies to the same status atomically (single commit).
+
+    Unknown ids are reported back rather than failing the whole batch."""
+    unique_ids = list(dict.fromkeys(event_ids))
+    try:
+        events = (
+            await db.execute(select(AnomalyEvent).where(AnomalyEvent.id.in_(unique_ids)))
+        ).scalars().all()
+        found_by_id = {event.id: event for event in events}
+
+        now = datetime.now(timezone.utc)
+        for event in events:
+            previous_status = event.status
+            event.status = status_value
+            if status_value == AnomalyStatus.RESOLVED:
+                event.resolved_at = now
+            elif status_value == AnomalyStatus.OPEN:
+                event.resolved_at = None
+            await db.flush()
+            await _append_anomaly_audit(
+                db,
+                event,
+                actor=_audit_actor(audit_actor, event.actor),
+                subtype="ANOMALY_STATUS_UPDATED",
+                description=(
+                    f"Anomaly status updated: {previous_status.value} -> {event.status.value}"
+                ),
+                previous_status=previous_status,
+            )
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    updated_ids = [event_id for event_id in unique_ids if event_id in found_by_id]
+    not_found_ids = [event_id for event_id in unique_ids if event_id not in found_by_id]
+    return BulkStatusResponse(
+        new_status=status_value.value,
+        requested=len(unique_ids),
+        updated=len(updated_ids),
+        updated_ids=updated_ids,
+        not_found_ids=not_found_ids,
+    )
+
+
+async def get_anomaly_trends(
+    db: AsyncSession, *, from_timestamp: datetime, to_timestamp: datetime, interval: str
+) -> AnomalyTrends:
+    rows = (
+        await db.execute(
+            select(
+                func.date_trunc(interval, AnomalyEvent.occurred_at).label("bucket"),
+                AnomalyEvent.severity,
+                func.count().label("count"),
+            )
+            .where(
+                AnomalyEvent.occurred_at >= from_timestamp,
+                AnomalyEvent.occurred_at <= to_timestamp,
+            )
+            .group_by("bucket", AnomalyEvent.severity)
+            .order_by("bucket")
+        )
+    ).all()
+    return AnomalyTrends(
+        interval=interval,
+        from_timestamp=from_timestamp,
+        to_timestamp=to_timestamp,
+        buckets=[
+            AnomalyTrendBucket(bucket=row.bucket, severity=row.severity.value, count=row.count)
+            for row in rows
+        ],
+    )
+
+
+async def get_anomaly_types(db: AsyncSession) -> AnomalyTypesResponse:
+    total_rows = dict(
+        (
+            await db.execute(
+                select(AnomalyEvent.category, func.count()).group_by(AnomalyEvent.category)
+            )
+        ).all()
+    )
+    open_rows = dict(
+        (
+            await db.execute(
+                select(AnomalyEvent.category, func.count())
+                .where(AnomalyEvent.status.in_((AnomalyStatus.OPEN, AnomalyStatus.INVESTIGATING)))
+                .group_by(AnomalyEvent.category)
+            )
+        ).all()
+    )
+    categories = [
+        AnomalyTypeStat(category=category, total=total, open_count=open_rows.get(category, 0))
+        for category, total in sorted(total_rows.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+    return AnomalyTypesResponse(
+        categories=categories,
+        severities=[s.value for s in AnomalySeverity],
+        statuses=[s.value for s in AnomalyStatus],
+    )

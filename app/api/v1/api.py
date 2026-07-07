@@ -9,6 +9,9 @@ from app.api.v1.endpoints import (
     dashboard,
     engine,
     hsm,
+    notifications,
+    operations,
+    rbac,
     system,
     tenancy,
 )
@@ -24,3 +27,7 @@ api_router.include_router(hsm.router, prefix="/hsm", tags=["hsm-security"])
 api_router.include_router(tenancy.router, prefix="/tenancy", tags=["tenancy"])
 api_router.include_router(dashboard.router, prefix="/dashboard", tags=["dashboard"])
 api_router.include_router(system.router, prefix="/system", tags=["system"])
+api_router.include_router(rbac.router, prefix="/rbac", tags=["rbac"])
+api_router.include_router(notifications.router, tags=["notifications"])
+api_router.include_router(notifications.alert_rules_router, tags=["notifications"])
+api_router.include_router(operations.router, prefix="/operations", tags=["operations"])

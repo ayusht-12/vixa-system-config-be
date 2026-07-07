@@ -11,6 +11,9 @@ from app.models.compliance import (
 )
 from app.models.config import ConfigChange, ConfigParameter, Configuration
 from app.models.engine import ApiEndpointStat, EngineInstance, EtcdNode, SystemMetricSample
+from app.models.notification import AlertRule, Notification
+from app.models.operations import ApplicationError, BackgroundJob
+from app.models.rbac import Permission, Role, RolePermission, UserRole
 from app.models.hsm import (
     AttestationRun,
     Certificate,
@@ -69,4 +72,12 @@ __all__ = [
     "TenantProvisioningJob",
     "TenantSchemaValidation",
     "TenantBackupSnapshot",
+    "Role",
+    "Permission",
+    "UserRole",
+    "RolePermission",
+    "Notification",
+    "AlertRule",
+    "BackgroundJob",
+    "ApplicationError",
 ]

@@ -8,16 +8,22 @@ from app.api.deps import get_current_user, get_db
 from app.core.config import settings
 from app.models.user import User
 from app.schemas.common import Page
+from app.schemas.compliance import ComplianceSummary
 from app.schemas.dashboard import (
+    AnomalyOverviewKpis,
     AuditLogEntryRead,
     DashboardSummary,
     EventTrends,
     TenantHealthList,
     TrendInterval,
 )
+from app.schemas.hsm import SecuritySummary
 from app.services.dashboard_service import (
     get_activity,
+    get_anomaly_overview,
+    get_compliance_overview,
     get_event_trends,
+    get_security_overview,
     get_summary,
     get_tenant_health,
 )
@@ -84,3 +90,27 @@ async def read_event_trends(
     return await get_event_trends(
         db, from_timestamp=from_timestamp, to_timestamp=to_timestamp, interval=interval
     )
+
+
+@router.get("/anomaly-overview", response_model=AnomalyOverviewKpis)
+async def read_anomaly_overview(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> AnomalyOverviewKpis:
+    return await get_anomaly_overview(db)
+
+
+@router.get("/compliance-overview", response_model=ComplianceSummary)
+async def read_compliance_overview(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> ComplianceSummary:
+    return await get_compliance_overview(db)
+
+
+@router.get("/security-overview", response_model=SecuritySummary)
+async def read_security_overview(
+    db: AsyncSession = Depends(get_db),
+    _: User = Depends(get_current_user),
+) -> SecuritySummary:
+    return await get_security_overview(db)
